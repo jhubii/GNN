@@ -55,6 +55,28 @@ def get_exp_id(config: str) -> str:
     }[config]
 
 
+def maybe_show_comparison_bar(base_dir: Path, dataset_name: str, exp_id: str):
+    """
+    Show the comparison bar graph:
+      results/<dataset_name>/<exp_id>/plots/compare_<dataset_name>_<exp_id>_dirgcn_vs_enhanced.png
+    """
+    compare_path = (
+        base_dir / "plots" / f"compare_{dataset_name}_{exp_id}_dirgcn_vs_enhanced.png"
+    )
+    if compare_path.exists():
+        st.subheader("Overall Comparison (Baseline vs Enhanced)")
+        st.image(str(compare_path), use_container_width=True)
+        st.caption(
+            "Figure: Test metrics (Accuracy, F1, Precision, Recall, etc.) for "
+            "Baseline Dir-GCN vs Enhanced Dir-GCN."
+        )
+    else:
+        st.info(
+            f"No comparison plot found at {compare_path}. "
+            "Make sure compare_models.py generated it."
+        )
+
+
 # ====== Sidebar / controls ======
 st.sidebar.header("Configuration")
 
@@ -83,6 +105,9 @@ if comparison_data is None:
 else:
     st.subheader("Metric Comparison (Baseline vs Enhanced)")
     render_metrics_table(comparison_data)
+
+    # 🟥 Comparison bar graph (the one you said is missing)
+    maybe_show_comparison_bar(base_dir, dataset_name, exp_id)
 
     st.markdown("---")
     st.subheader("Diagnostic Plots")
@@ -144,7 +169,13 @@ else:
 st.markdown("---")
 
 # ====== Node-level Prediction (using precomputed JSON) ======
-st.header("Node-level Fraud Prediction (from precomputed GNN outputs)")
+st.header("Node-level Fraud Prediction")
+
+st.write(
+    "Use this panel to inspect the model's prediction for a specific node "
+    "(account / address / transaction entity), including its predicted class "
+    "and fraud probability."
+)
 
 predictions_path = base_dir / "predictions" / f"{conv_type}_node_predictions.json"
 predictions = load_json(predictions_path)
