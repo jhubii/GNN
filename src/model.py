@@ -1,6 +1,7 @@
 import torch
 from torch import nn, optim
 import pytorch_lightning as pl
+
 from torch_sparse import SparseTensor
 import torch.nn.functional as F
 from torch.nn import ModuleList, Linear
@@ -22,31 +23,61 @@ from src.datasets.data_utils import get_norm_adj
 # ---------------------------------------------------------------------------
 
 
-def get_conv(conv_type, input_dim, output_dim, alpha):
+def get_conv(
+    conv_type: str,
+    input_dim: int,
+    output_dim: int,
+    alpha,
+    lcs_threshold: float = 0.0,
+    enable_lcs_masking: bool = False,
+):
+    """
+    Factory for convolution layers.
+
+    Baseline:
+      conv_type = "dir-gcn"       -> DirGCNConv
+
+    Enhanced (paper-enhanced DIR-GCN):
+      conv_type = "dir-gcn-gated" -> GatedDirGCNConv
+        - Direction-specific aggregation and gated feature fusion
+        - Local Contribution Score (LCS) Masking
+        - Structural hash caching + recurrence diagnostics
+        - MP-operation counter
+        - Mini-batch Recurrence / Neighbor-Value sampling
+    """
     if conv_type == "dir-gcn":
         return DirGCNConv(input_dim, output_dim, alpha)
     elif conv_type == "dir-gcn-gated":
-        return GatedDirGCNConv(input_dim, output_dim, alpha)
+        return GatedDirGCNConv(
+            input_dim,
+            output_dim,
+            alpha,
+            lcs_threshold=lcs_threshold,
+            enable_lcs_masking=enable_lcs_masking,
+        )
     else:
         raise ValueError(f"Convolution type {conv_type} not supported")
 
 
 # ---------------------------------------------------------------------------
-# Baseline Dir-GCN convolution
+# Baseline Dir-GCN convolution (paper’s original layer)
 # ---------------------------------------------------------------------------
 
 
 class DirGCNConv(torch.nn.Module):
     """
-    Baseline Dir-GCN layer.
+    Baseline DIR-GCN layer (original directed GCN operator).
 
     Uses a global (possibly learnable) alpha to mix:
-      - src→dst (forward) messages
-      - dst→src (reverse) messages
+      - src→dst (forward / inbound) messages
+      - dst→src (reverse / outbound) messages
+
+    Added in this implementation:
+      - mp_operation_stats: counts raw message-passing operations per layer
     """
 
     def __init__(self, input_dim, output_dim, alpha):
-        super(DirGCNConv, self).__init__()
+        super().__init__()
 
         self.input_dim = input_dim
         self.output_dim = output_dim
@@ -54,12 +85,26 @@ class DirGCNConv(torch.nn.Module):
         self.lin_src_to_dst = Linear(input_dim, output_dim)
         self.lin_dst_to_src = Linear(input_dim, output_dim)
         self.alpha = alpha
-        self.adj_norm, self.adj_t_norm = None, None
+
+        # Cached normalized adjacency for forward and reverse directions
+        self.adj_norm = None
+        self.adj_t_norm = None
+
+        # Explicit MP-operation counter (no structural reuse here)
+        self.mp_operation_stats = {
+            "naive_ops": 0,  # how many MP ops a naive implementation would do
+            "actual_ops": 0,  # actual ops (same as naive for baseline layer)
+            "saved_ops": 0,
+            "saved_ratio": 0.0,
+        }
 
     def forward(self, x, edge_index):
-        if self.adj_norm is None:
+        num_edges = edge_index.size(1)
+
+        # Lazy construction of normalized adjacency matrices
+        if self.adj_norm is None or self.adj_t_norm is None:
             row, col = edge_index
-            num_nodes = x.shape[0]
+            num_nodes = x.size(0)
 
             adj = SparseTensor(row=row, col=col, sparse_sizes=(num_nodes, num_nodes))
             self.adj_norm = get_norm_adj(adj, norm="dir")
@@ -67,49 +112,78 @@ class DirGCNConv(torch.nn.Module):
             adj_t = SparseTensor(row=col, col=row, sparse_sizes=(num_nodes, num_nodes))
             self.adj_t_norm = get_norm_adj(adj_t, norm="dir")
 
-        return self.alpha * self.lin_src_to_dst(self.adj_norm @ x) + (
-            1 - self.alpha
-        ) * self.lin_dst_to_src(self.adj_t_norm @ x)
+        h_forward = self.lin_src_to_dst(self.adj_norm @ x)
+        h_reverse = self.lin_dst_to_src(self.adj_t_norm @ x)
+
+        out = self.alpha * h_forward + (1.0 - self.alpha) * h_reverse
+
+        # ---- Message-passing operation counter ----
+        # 2 directional paths (in / out) per edge
+        ops_this_layer = 2 * num_edges
+        self.mp_operation_stats["naive_ops"] += ops_this_layer
+        self.mp_operation_stats["actual_ops"] += ops_this_layer
+        self.mp_operation_stats["saved_ops"] = 0
+        self.mp_operation_stats["saved_ratio"] = 0.0
+
+        return out
 
 
 # ---------------------------------------------------------------------------
-# Enhanced Dir-GCN with edge-wise contribution scores + gating + residual
+# Enhanced DIR-GCN with LCS Masking + Structural Hash Caching + Mini-batch
 # ---------------------------------------------------------------------------
 
 
 class GatedDirGCNConv(torch.nn.Module):
     """
-    Enhanced Dir-GCN layer.
+    Enhanced DIR-GCN layer (paper’s enhanced DIR-GNN component).
 
-    Differences vs baseline:
-      - Computes learnable edge-wise contribution scores a_ij
-      - Aggregates messages along src→dst and dst→src using these scores
-      - Normalizes by (in/out) degree for stability
-      - Learns a node-wise gate g ∈ (0,1) to fuse the two directional
-        aggregations
-      - Adds a residual connection from the original node features
+    Adds on top of the baseline DIR-GCN:
+      - Direction-aware message passing with separate inbound/outbound flows
+      - Node-wise gating over inbound vs outbound messages
+      - Local Contribution Score (LCS) Masking for neighbor importance
+      - Structural hash caching of unique edges + recurrence statistics
+      - Redundancy-eliminated message passing via unique (src,dst) edges
+      - Explicit MP-operation counter with savings vs naive DIR-GCN
+      - Mini-batch Recurrence / Neighbor-Value sampling
+
+    Diagnostics (for Chapter 4 / Problem 3):
+      - recurring_transaction_stats
+          counts + ratio of recurring transactions (duplicate directed edges)
+      - lcs_masking_stats
+          counts + ratio of edges pruned by Local Contribution Score (LCS) Masking
+      - mp_operation_stats
+          naive vs actual message-passing operations, plus savings ratio
+      - last_lcs_mask
+          Bool[E_unique] of unique edges kept when masking is enabled
     """
 
-    def __init__(self, input_dim, output_dim, alpha):
-        super(GatedDirGCNConv, self).__init__()
+    def __init__(
+        self,
+        input_dim,
+        output_dim,
+        alpha,
+        lcs_threshold: float = 0.0,
+        enable_lcs_masking: bool = False,
+    ):
+        super().__init__()
 
         self.input_dim = input_dim
         self.output_dim = output_dim
 
-        # Direction-specific projections (like baseline)
+        # Direction-specific projections (same idea as baseline DIR-GCN)
         self.lin_src_to_dst = Linear(input_dim, output_dim)
         self.lin_dst_to_src = Linear(input_dim, output_dim)
 
-        # Edge scoring network: uses original node features (x_src, x_dst)
-        # to compute a local contribution score for each edge.
-        # a_ij = sigmoid(edge_mlp([x_i || x_j]))
-        self.edge_mlp = nn.Sequential(
+        # Local Contribution Score (LCS) network
+        # LCS_ij = sigmoid(lcs_mlp([x_i || x_j]))
+        self.lcs_mlp = nn.Sequential(
             Linear(2 * input_dim, input_dim),
             nn.ReLU(),
             Linear(input_dim, 1),
         )
 
-        # Node-wise gate: [h_in || h_out] -> g ∈ (0,1)
+        # Node-wise gate over inbound / outbound aggregated messages
+        # gate = sigmoid(gate_mlp([h_in || h_out]))
         self.gate_mlp = nn.Sequential(
             Linear(2 * output_dim, output_dim),
             nn.ReLU(),
@@ -121,68 +195,372 @@ class GatedDirGCNConv(torch.nn.Module):
             Linear(input_dim, output_dim) if input_dim != output_dim else nn.Identity()
         )
 
-        # alpha kept only for compatibility with get_conv API
+        # Local Contribution Score (LCS) controls
+        self.lcs_threshold = float(lcs_threshold)
+        self.enable_lcs_masking = bool(enable_lcs_masking)
+
+        # Diagnostics / cache handles (not saved in state_dict)
+        self.last_lcs_mask = None  # Bool[E_unique]
+        self.lcs_masking_stats = None  # LCS pruning statistics
+        self.recurring_transaction_stats = None  # duplicate edge statistics
+
+        # Structural hash cache (reused across epochs for fixed graph):
+        #   - _cached_src, _cached_dst: original (possibly duplicated) edges
+        #   - _unique_src, _unique_dst: unique (src,dst) edge set
+        #   - _unique_counts: multiplicity for each unique edge
+        #   - _num_edges_total / _num_unique_edges
+        #   - _cached_in_deg / _cached_out_deg: degree counts (with recurrence)
+        self._cached_src = None
+        self._cached_dst = None
+        self._cached_in_deg = None
+        self._cached_out_deg = None
+
+        self._unique_src = None
+        self._unique_dst = None
+        self._unique_counts = None
+        self._num_edges_total = None
+        self._num_unique_edges = None
+
+        # Explicit MP-operation counter (compares naive vs cached)
+        self.mp_operation_stats = {
+            "naive_ops": 0,
+            "actual_ops": 0,
+            "saved_ops": 0,
+            "saved_ratio": 0.0,
+        }
+
+        # Alpha kept for compatibility with get_conv API (not used directly)
         self.alpha = alpha
 
-    def forward(self, x, edge_index):
+    # -------------------- helpers -------------------- #
+
+    def _init_structure_cache(self, edge_index: torch.Tensor, num_nodes: int):
+        """
+        One-time structural preprocessing for this graph:
+
+          - Cache src/dst index tensors
+          - Cache structural hash on (src,dst) via unique() for reuse
+          - Cache in/out degrees accounting for recurring edges
+          - Compute recurring transaction statistics (duplicate edges)
+        """
+        src, dst = edge_index  # [E], [E]
+        self._cached_src = src
+        self._cached_dst = dst
+
+        # Structural hash caching: group identical edges via unique()
+        pairs = torch.stack([src, dst], dim=1)  # [E, 2]
+        if pairs.numel() == 0:
+            self._unique_src = src
+            self._unique_dst = dst
+            self._unique_counts = torch.zeros_like(src)
+            self._num_edges_total = 0
+            self._num_unique_edges = 0
+
+            self._cached_in_deg = torch.ones(num_nodes)
+            self._cached_out_deg = torch.ones(num_nodes)
+
+            self.recurring_transaction_stats = {
+                "num_edges": 0,
+                "num_unique_edges": 0,
+                "num_recurring_edges": 0,
+                "recurring_ratio": 0.0,
+            }
+            return
+
+        unique_pairs, inverse_indices, counts = pairs.unique(
+            dim=0, return_inverse=True, return_counts=True
+        )
+
+        self._unique_src = unique_pairs[:, 0]
+        self._unique_dst = unique_pairs[:, 1]
+        self._unique_counts = counts
+        self._num_edges_total = int(pairs.size(0))
+        self._num_unique_edges = int(unique_pairs.size(0))
+
+        # Degrees with recurrence: each duplicate edge contributes 1 to degree
+        counts_f = counts.to(torch.float32)
+        in_deg = scatter_add(
+            counts_f, self._unique_dst, dim=0, dim_size=num_nodes
+        ).clamp(min=1.0)
+        out_deg = scatter_add(
+            counts_f, self._unique_src, dim=0, dim_size=num_nodes
+        ).clamp(min=1.0)
+        self._cached_in_deg = in_deg
+        self._cached_out_deg = out_deg
+
+        # ---- Recurring transactions: duplicate directed edges (src, dst) ----
+        num_recurring_edges = int(self._num_edges_total - self._num_unique_edges)
+        recurring_ratio = (
+            float(num_recurring_edges) / float(self._num_edges_total)
+            if self._num_edges_total > 0
+            else 0.0
+        )
+        self.recurring_transaction_stats = {
+            "num_edges": self._num_edges_total,
+            "num_unique_edges": self._num_unique_edges,
+            "num_recurring_edges": num_recurring_edges,
+            "recurring_ratio": recurring_ratio,
+        }
+
+    # -------------------- Mini-Batch Recurrence / Neighbor-Value Sampler ---- #
+
+    @torch.no_grad()
+    def mini_batch_recurrence_neighbor_value_sampling(
+        self,
+        x: torch.Tensor,
+        batch_nodes: torch.Tensor,
+        num_neighbors: int = 10,
+        recurrence_weight: float = 0.5,
+        neighbor_value_weight: float = 0.5,
+    ):
+        """
+        Implements the Recurrence / Neighbor-Value sampling heuristic
+        described in Section 3.4.1 (Mini-Batch Sampling).
+
+        Given:
+          - x: [N, F] node features
+          - batch_nodes: [B] seed node indices
+        Returns:
+          - sampled_edge_indices: 1D LongTensor indices into the UNIQUE edge set
+            (self._unique_src / self._unique_dst) representing the edges to
+            include for this mini-batch.
+        """
+        if self._unique_src is None or self._unique_dst is None:
+            raise RuntimeError(
+                "Structure cache not initialized. Call the layer at least once "
+                "or call _init_structure_cache before using the sampler."
+            )
+
+        device = x.device
+        batch_nodes = batch_nodes.to(device)
+
+        src_u = self._unique_src.to(device)
+        dst_u = self._unique_dst.to(device)
+        counts = self._unique_counts.to(device).float()
+
+        # 1) Neighbor mask: edges incident to any batch node
+        incident_mask = (src_u.unsqueeze(0) == batch_nodes.unsqueeze(1)) | (
+            dst_u.unsqueeze(0) == batch_nodes.unsqueeze(1)
+        )
+        incident_mask = incident_mask.any(dim=0)
+
+        if incident_mask.sum() == 0:
+            # No neighbors detected, return empty selection
+            return torch.empty(0, dtype=torch.long, device=device)
+
+        edge_idx_incident = torch.nonzero(incident_mask, as_tuple=False).view(-1)
+
+        # 2) Recurrence Score (RS): normalized counts
+        counts_incident = counts[edge_idx_incident]
+        if counts_incident.numel() > 0:
+            rs = counts_incident / counts_incident.max()
+        else:
+            rs = torch.zeros_like(counts_incident)
+
+        # 3) Neighbor Value Score (NVS): based on Local Contribution Score (LCS)
+        x_src = x[src_u[edge_idx_incident]]
+        x_dst = x[dst_u[edge_idx_incident]]
+        lcs_input = torch.cat([x_src, x_dst], dim=-1)
+        nvs = torch.sigmoid(self.lcs_mlp(lcs_input)).squeeze(-1)  # already in (0,1)
+
+        # 4) Combined importance
+        total_w = recurrence_weight + neighbor_value_weight
+        if total_w <= 0:
+            total_w = 1.0
+        rw = recurrence_weight / total_w
+        nw = neighbor_value_weight / total_w
+
+        combined_score = rw * rs + nw * nvs
+
+        # 5) Top-k selection over incident edges
+        k = min(num_neighbors * max(1, batch_nodes.numel()), edge_idx_incident.numel())
+        _, topk_idx = torch.topk(combined_score, k=k, largest=True, sorted=False)
+
+        sampled_edge_indices = edge_idx_incident[topk_idx]
+        return sampled_edge_indices
+
+    # -------------------- forward -------------------- #
+
+    def forward(self, x, edge_index, batch_nodes: torch.Tensor = None):
         """
         x: [N, F]
         edge_index: [2, E] (directed edges, src->dst)
+        batch_nodes: Optional[LongTensor] of seed nodes for mini-batch training.
+                     If None, uses the full graph.
+
+        This forward pass uses:
+          - Structural hash caching of unique (src,dst) edges
+          - Redundancy-eliminated message passing
+          - Optional LCS Masking
+          - Optional Recurrence/Neighbor-Value mini-batch sampling
+          - Node-wise gated fusion of inbound and outbound flows
+          - Residual connection
+          - MP-operation counter
         """
         num_nodes = x.size(0)
-        src, dst = edge_index  # [E], [E]
+
+        # Initialize / reuse structural cache
+        if self._unique_src is None or self._unique_dst is None:
+            self._init_structure_cache(edge_index, num_nodes)
+
+        src_u = self._unique_src
+        dst_u = self._unique_dst
+        counts = self._unique_counts.float()
+        num_edges_total_global = int(self._num_edges_total or 0)
+
+        # ---- Mini-batch sampling over UNIQUE edges (optional) ----
+        if batch_nodes is not None:
+            sampled_idx = self.mini_batch_recurrence_neighbor_value_sampling(
+                x, batch_nodes
+            )
+            if sampled_idx.numel() == 0:
+                # Fallback to use all edges if no edges sampled
+                sampled_idx = torch.arange(
+                    src_u.size(0), device=src_u.device, dtype=torch.long
+                )
+        else:
+            sampled_idx = torch.arange(
+                src_u.size(0), device=src_u.device, dtype=torch.long
+            )
+
+        src_sampled = src_u[sampled_idx]
+        dst_sampled = dst_u[sampled_idx]
+        counts_sampled = counts[sampled_idx]
 
         # --------------------------------------------------
-        # 1) Edge-wise contribution scores (local importance)
+        # 1) Local Contribution Score (LCS) for each UNIQUE sampled edge
         # --------------------------------------------------
-        x_src = x[src]  # [E, F]
-        x_dst = x[dst]  # [E, F]
+        x_src = x[src_sampled]  # [E_eff, F]
+        x_dst = x[dst_sampled]  # [E_eff, F]
 
-        edge_input = torch.cat([x_src, x_dst], dim=-1)  # [E, 2F]
-        edge_score = torch.sigmoid(self.edge_mlp(edge_input)).squeeze(-1)  # [E]
-
-        # --------------------------------------------------
-        # 2) Directional messages
-        # --------------------------------------------------
-        # src→dst messages: project source features
-        msg_in = self.lin_src_to_dst(x_src)  # [E, D]
-
-        # dst→src messages: project destination features
-        msg_out = self.lin_dst_to_src(x_dst)  # [E, D]
-
-        # weight messages by local contribution scores
-        msg_in = msg_in * edge_score.unsqueeze(-1)  # [E, D]
-        msg_out = msg_out * edge_score.unsqueeze(-1)  # [E, D]
+        lcs_input = torch.cat([x_src, x_dst], dim=-1)  # [E_eff, 2F]
+        lcs = torch.sigmoid(self.lcs_mlp(lcs_input)).squeeze(-1)  # [E_eff]
 
         # --------------------------------------------------
-        # 3) Aggregate with degree normalization
+        # 2) LCS Masking (optional redundancy control)
         # --------------------------------------------------
-        # in-direction: aggregate messages into dst
+        # For MP-operation diagnostics we track two notions:
+        #   - num_edges_total_global: full-graph duplicate edges
+        #   - num_edges_total_effective: edges (with duplicates) in this sampled set
+        num_edges_total_effective = int(counts_sampled.sum().item())
+
+        if self.enable_lcs_masking and self.lcs_threshold > 0.0:
+            mask = lcs >= self.lcs_threshold  # True = keep
+            num_unique_total = int(lcs.numel())
+
+            # Edge counts are defined on sampled unique edges
+            edges_kept = int(counts_sampled[mask].sum().item())
+            edges_pruned = int(num_edges_total_effective - edges_kept)
+
+            # Avoid degenerate case where all edges are pruned
+            if edges_kept == 0 and num_unique_total > 0:
+                mask = torch.ones_like(lcs, dtype=torch.bool)
+                edges_kept = num_edges_total_effective
+                edges_pruned = 0
+
+            # Save diagnostics for Problem 3 (LCS masking effectiveness)
+            self.last_lcs_mask = mask.detach()
+            self.lcs_masking_stats = {
+                "num_edges_total": num_edges_total_effective,
+                "num_edges_kept": edges_kept,
+                "num_edges_pruned": edges_pruned,
+                "pruned_ratio": float(edges_pruned) / float(num_edges_total_effective)
+                if num_edges_total_effective > 0
+                else 0.0,
+                "threshold": float(self.lcs_threshold),
+            }
+
+            # Apply mask at the sampled UNIQUE-edge level
+            src = src_sampled[mask]
+            dst = dst_sampled[mask]
+            lcs_kept = lcs[mask]
+            counts_kept = counts_sampled[mask]
+        else:
+            self.last_lcs_mask = None
+            self.lcs_masking_stats = None
+
+            src = src_sampled
+            dst = dst_sampled
+            lcs_kept = lcs
+            counts_kept = counts_sampled
+
+        num_unique_effective = int(src.numel())
+
+        # --------------------------------------------------
+        # 3) Directional messages with LCS weighting
+        #     + recurrence-based scaling via counts_kept
+        # --------------------------------------------------
+        x_src_eff = x[src]
+        x_dst_eff = x[dst]
+
+        msg_in = self.lin_src_to_dst(x_src_eff)  # src → dst (inbound direction)
+        msg_out = self.lin_dst_to_src(x_dst_eff)  # dst → src (outbound direction)
+
+        lcs_kept = lcs_kept.unsqueeze(-1)  # [E_eff, 1]
+        counts_kept = counts_kept.unsqueeze(-1)  # [E_eff, 1]
+
+        # weight by LCS and recurrence multiplicity
+        msg_in = msg_in * lcs_kept * counts_kept
+        msg_out = msg_out * lcs_kept * counts_kept
+
+        # --------------------------------------------------
+        # 4) Aggregate with degree normalization
+        # --------------------------------------------------
         h_in = scatter_add(msg_in, dst, dim=0, dim_size=num_nodes)  # [N, D]
-
-        # out-direction (reverse): aggregate messages into src
         h_out = scatter_add(msg_out, src, dim=0, dim_size=num_nodes)  # [N, D]
 
-        # Normalize by degrees for scale stability
-        in_deg = degree(dst, num_nodes=num_nodes, dtype=torch.float32).clamp(min=1.0)
-        out_deg = degree(src, num_nodes=num_nodes, dtype=torch.float32).clamp(min=1.0)
+        # Recompute degrees on kept edges for mini-batch OR masking;
+        # otherwise reuse full-graph cached degrees.
+        if (batch_nodes is not None) or (
+            self.enable_lcs_masking and self.lcs_threshold > 0.0
+        ):
+            counts_float = counts_kept.squeeze(-1)
+            in_deg = scatter_add(counts_float, dst, dim=0, dim_size=num_nodes).clamp(
+                min=1.0
+            )
+            out_deg = scatter_add(counts_float, src, dim=0, dim_size=num_nodes).clamp(
+                min=1.0
+            )
+        else:
+            in_deg = self._cached_in_deg
+            out_deg = self._cached_out_deg
 
         h_in = h_in / in_deg.unsqueeze(-1)
         h_out = h_out / out_deg.unsqueeze(-1)
 
         # --------------------------------------------------
-        # 4) Node-wise gate between directional aggregations
+        # 5) Node-wise gate between inbound and outbound aggregations
         # --------------------------------------------------
         gate_input = torch.cat([h_in, h_out], dim=-1)  # [N, 2D]
-        g = torch.sigmoid(self.gate_mlp(gate_input))  # [N, 1]
+        gate = torch.sigmoid(self.gate_mlp(gate_input))  # [N, 1]
 
-        fused = g * h_in + (1.0 - g) * h_out  # [N, D]
+        fused = gate * h_in + (1.0 - gate) * h_out  # [N, D]
 
         # --------------------------------------------------
-        # 5) Residual connection
+        # 6) Residual connection
         # --------------------------------------------------
         res = self.residual(x)  # [N, D]
         out = fused + res
+
+        # --------------------------------------------------
+        # 7) MP-operation counter (naive vs structural hash caching)
+        # --------------------------------------------------
+        # naive: 2 * (# duplicate edges in this sampled subset)
+        naive_ops_this = 2 * num_edges_total_effective
+        # actual: 2 * (# unique sampled edges after masking and/or sampling)
+        actual_ops_this = 2 * num_unique_effective
+
+        self.mp_operation_stats["naive_ops"] += naive_ops_this
+        self.mp_operation_stats["actual_ops"] += actual_ops_this
+        self.mp_operation_stats["saved_ops"] = (
+            self.mp_operation_stats["naive_ops"] - self.mp_operation_stats["actual_ops"]
+        )
+        if self.mp_operation_stats["naive_ops"] > 0:
+            self.mp_operation_stats["saved_ratio"] = float(
+                self.mp_operation_stats["saved_ops"]
+            ) / float(self.mp_operation_stats["naive_ops"])
+        else:
+            self.mp_operation_stats["saved_ratio"] = 0.0
 
         return out
 
@@ -199,34 +577,81 @@ class GNN(torch.nn.Module):
         num_classes,
         hidden_dim,
         num_layers=2,
-        dropout=0,
+        dropout=0.0,
         conv_type="dir-gcn",
         jumping_knowledge=False,
         normalize=False,
-        alpha=1 / 2,
+        alpha=0.5,
         learn_alpha=False,
+        lcs_threshold: float = 0.0,
+        enable_lcs_masking: bool = False,
     ):
-        super(GNN, self).__init__()
+        super().__init__()
 
-        self.num_classes = num_classes  # for metrics
+        self.num_classes = num_classes
         self.alpha = nn.Parameter(torch.ones(1) * alpha, requires_grad=learn_alpha)
 
+        self.conv_type = conv_type
+        self.lcs_threshold = lcs_threshold
+        self.enable_lcs_masking = enable_lcs_masking
+
         output_dim = hidden_dim if jumping_knowledge else num_classes
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.jumping_knowledge = jumping_knowledge
+        self.normalize = normalize
+
+        # Build convolution stack
         if num_layers == 1:
             self.convs = ModuleList(
-                [get_conv(conv_type, num_features, output_dim, self.alpha)]
+                [
+                    get_conv(
+                        conv_type,
+                        num_features,
+                        output_dim,
+                        self.alpha,
+                        lcs_threshold=self.lcs_threshold,
+                        enable_lcs_masking=self.enable_lcs_masking,
+                    )
+                ]
             )
         else:
             self.convs = ModuleList(
-                [get_conv(conv_type, num_features, hidden_dim, self.alpha)]
+                [
+                    get_conv(
+                        conv_type,
+                        num_features,
+                        hidden_dim,
+                        self.alpha,
+                        lcs_threshold=self.lcs_threshold,
+                        enable_lcs_masking=self.enable_lcs_masking,
+                    )
+                ]
             )
             for _ in range(num_layers - 2):
                 self.convs.append(
-                    get_conv(conv_type, hidden_dim, hidden_dim, self.alpha)
+                    get_conv(
+                        conv_type,
+                        hidden_dim,
+                        hidden_dim,
+                        self.alpha,
+                        lcs_threshold=self.lcs_threshold,
+                        enable_lcs_masking=self.enable_lcs_masking,
+                    )
                 )
-            self.convs.append(get_conv(conv_type, hidden_dim, output_dim, self.alpha))
+            self.convs.append(
+                get_conv(
+                    conv_type,
+                    hidden_dim,
+                    output_dim,
+                    self.alpha,
+                    lcs_threshold=self.lcs_threshold,
+                    enable_lcs_masking=self.enable_lcs_masking,
+                )
+            )
 
-        if jumping_knowledge is not None:
+        # Jumping knowledge
+        if jumping_knowledge is not None and jumping_knowledge:
             input_dim = (
                 hidden_dim * num_layers if jumping_knowledge == "cat" else hidden_dim
             )
@@ -234,32 +659,37 @@ class GNN(torch.nn.Module):
             self.jump = JumpingKnowledge(
                 mode=jumping_knowledge, channels=hidden_dim, num_layers=num_layers
             )
+        else:
+            self.lin = None
+            self.jump = None
 
-        self.num_layers = num_layers
-        self.dropout = dropout
-        self.jumping_knowledge = jumping_knowledge
-        self.normalize = normalize
-
-    def forward(self, x, edge_index):
+    def forward(self, x, edge_index, batch_nodes: torch.Tensor = None):
         xs = []
         for i, conv in enumerate(self.convs):
-            x = conv(x, edge_index)
+            # Only the enhanced layer knows how to use batch_nodes
+            if isinstance(conv, GatedDirGCNConv):
+                x = conv(x, edge_index, batch_nodes=batch_nodes)
+            else:
+                x = conv(x, edge_index)
+
             if i != len(self.convs) - 1 or self.jumping_knowledge:
                 x = F.relu(x)
                 x = F.dropout(x, p=self.dropout, training=self.training)
                 if self.normalize:
                     x = F.normalize(x, p=2, dim=1)
-            xs += [x]
+            xs.append(x)
 
-        if self.jumping_knowledge is not None:
+        if self.jump is not None:
             x = self.jump(xs)
             x = self.lin(x)
 
-        return torch.nn.functional.log_softmax(x, dim=1)
+        return F.log_softmax(x, dim=1)
 
 
 # ---------------------------------------------------------------------------
-# Lightning wrapper with metrics
+# Lightning wrappers with metrics
+#   - Full-batch (baseline & optionally enhanced)
+#   - Mini-batch for Enhanced DIR-GCN (dir-gcn-gated)
 # ---------------------------------------------------------------------------
 
 
@@ -296,16 +726,18 @@ class LightingFullBatchModelWrapper(pl.LightningModule):
         self.test_prec = MulticlassPrecision(num_classes=num_classes, average="macro")
         self.test_rec = MulticlassRecall(num_classes=num_classes, average="macro")
 
+    def forward(self, x, edge_index):
+        # Full-batch: no mini-batching
+        return self.model(x, edge_index, batch_nodes=None)
+
     def training_step(self, batch, batch_idx):
         x, y, edge_index = batch.x, batch.y.long(), batch.edge_index
-        out = self.model(x, edge_index)
+        out = self.model(x, edge_index, batch_nodes=None)
 
-        loss = nn.functional.nll_loss(
-            out[self.train_mask], y[self.train_mask].squeeze()
-        )
+        loss = F.nll_loss(out[self.train_mask], y[self.train_mask].squeeze())
         self.log("train_loss", loss)
 
-        y_pred = out.max(1)[1]
+        y_pred = out.argmax(dim=1)
 
         # ----- train metrics -----
         self.log(
@@ -358,9 +790,9 @@ class LightingFullBatchModelWrapper(pl.LightningModule):
 
     def test_step(self, batch, batch_idx):
         x, y, edge_index = batch.x, batch.y.long(), batch.edge_index
-        out = self.model(x, edge_index)
+        out = self.model(x, edge_index, batch_nodes=None)
 
-        y_pred = out.max(1)[1]
+        y_pred = out.argmax(dim=1)
 
         # ----- test metrics -----
         self.log(
@@ -376,8 +808,180 @@ class LightingFullBatchModelWrapper(pl.LightningModule):
             self.test_rec(y_pred[self.test_mask], y[self.test_mask].squeeze()),
         )
 
-        val_acc = self.evaluate(y_pred=y_pred[self.test_mask], y_true=y[self.test_mask])
-        self.log("test_acc", val_acc)
+        test_acc = self.evaluate(
+            y_pred=y_pred[self.test_mask], y_true=y[self.test_mask]
+        )
+        self.log("test_acc", test_acc)
+
+    def configure_optimizers(self):
+        optimizer = optim.Adam(
+            self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay
+        )
+        return optimizer
+
+
+class LightingMiniBatchDirGatedWrapper(pl.LightningModule):
+    """
+    Lightning wrapper for Enhanced DIR-GCN (dir-gcn-gated) using
+    Mini-batch Recurrence / Neighbor-Value sampling over seed nodes.
+
+    Baseline remains full-batch; this is only used for conv_type='dir-gcn-gated'
+    when --mini_batch_training is enabled.
+    """
+
+    def __init__(
+        self,
+        model,
+        lr,
+        weight_decay,
+        train_mask,
+        val_mask,
+        test_mask,
+        evaluator=None,
+        mini_batch_size: int = 1024,
+    ):
+        super().__init__()
+        self.model = model
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.evaluator = evaluator
+
+        self.train_mask = train_mask
+        self.val_mask = val_mask
+        self.test_mask = test_mask
+
+        self.mini_batch_size = mini_batch_size
+
+        # ====== Metrics (macro over classes) ======
+        num_classes = int(getattr(self.model, "num_classes", 2))
+
+        # train metrics
+        self.train_f1 = MulticlassF1Score(num_classes=num_classes, average="macro")
+        self.train_prec = MulticlassPrecision(num_classes=num_classes, average="macro")
+        self.train_rec = MulticlassRecall(num_classes=num_classes, average="macro")
+
+        # val metrics
+        self.val_f1 = MulticlassF1Score(num_classes=num_classes, average="macro")
+        self.val_prec = MulticlassPrecision(num_classes=num_classes, average="macro")
+        self.val_rec = MulticlassRecall(num_classes=num_classes, average="macro")
+
+        # test metrics
+        self.test_f1 = MulticlassF1Score(num_classes=num_classes, average="macro")
+        self.test_prec = MulticlassPrecision(num_classes=num_classes, average="macro")
+        self.test_rec = MulticlassRecall(num_classes=num_classes, average="macro")
+
+    def forward(self, x, edge_index, batch_nodes=None):
+        return self.model(x, edge_index, batch_nodes=batch_nodes)
+
+    def _ensure_indices(self, device):
+        # Precompute node index tensors on the right device
+        if not hasattr(self, "_train_idx") or self._train_idx.device != device:
+            self._train_idx = torch.nonzero(
+                self.train_mask.to(device), as_tuple=False
+            ).view(-1)
+            self._val_idx = torch.nonzero(
+                self.val_mask.to(device), as_tuple=False
+            ).view(-1)
+            self._test_idx = torch.nonzero(
+                self.test_mask.to(device), as_tuple=False
+            ).view(-1)
+
+    def training_step(self, batch, batch_idx):
+        # batch is still the full graph, but we only train on a sampled subset
+        x = batch.x.to(self.device)
+        y = batch.y.long().view(-1).to(self.device)
+        edge_index = batch.edge_index.to(self.device)
+
+        self._ensure_indices(self.device)
+        train_idx = self._train_idx
+
+        # Sample mini-batch of seed nodes
+        batch_size = min(self.mini_batch_size, train_idx.numel())
+        perm = torch.randperm(train_idx.numel(), device=self.device)[:batch_size]
+        batch_nodes = train_idx[perm]
+
+        out = self.model(x, edge_index, batch_nodes=batch_nodes)
+
+        loss = F.nll_loss(out[batch_nodes], y[batch_nodes])
+        self.log("train_loss", loss)
+
+        y_pred = out.argmax(dim=1)
+
+        # ----- train metrics on mini-batch -----
+        self.log(
+            "train_f1",
+            self.train_f1(y_pred[batch_nodes], y[batch_nodes]),
+            prog_bar=True,
+        )
+        self.log(
+            "train_prec",
+            self.train_prec(y_pred[batch_nodes], y[batch_nodes]),
+        )
+        self.log(
+            "train_rec",
+            self.train_rec(y_pred[batch_nodes], y[batch_nodes]),
+        )
+
+        train_acc = self.evaluate(y_pred=y_pred[batch_nodes], y_true=y[batch_nodes])
+        self.log("train_acc", train_acc, prog_bar=True)
+
+        # ----- val metrics on full graph (as in full-batch wrapper) -----
+        self.log(
+            "val_f1",
+            self.val_f1(y_pred[self._val_idx], y[self._val_idx]),
+            prog_bar=True,
+        )
+        self.log(
+            "val_prec",
+            self.val_prec(y_pred[self._val_idx], y[self._val_idx]),
+        )
+        self.log(
+            "val_rec",
+            self.val_rec(y_pred[self._val_idx], y[self._val_idx]),
+        )
+
+        val_acc = self.evaluate(y_pred=y_pred[self._val_idx], y_true=y[self._val_idx])
+        self.log("val_acc", val_acc, prog_bar=True)
+
+        return loss
+
+    def evaluate(self, y_pred, y_true):
+        if self.evaluator:
+            acc = self.evaluator.eval(
+                {"y_true": y_true, "y_pred": y_pred.unsqueeze(1)}
+            )["acc"]
+        else:
+            acc = y_pred.eq(y_true.squeeze()).sum().item() / y_pred.shape[0]
+        return acc
+
+    def test_step(self, batch, batch_idx):
+        # Full-graph evaluation for test
+        x = batch.x.to(self.device)
+        y = batch.y.long().view(-1).to(self.device)
+        edge_index = batch.edge_index.to(self.device)
+
+        self._ensure_indices(self.device)
+
+        out = self.model(x, edge_index, batch_nodes=None)
+        y_pred = out.argmax(dim=1)
+
+        self.log(
+            "test_f1",
+            self.test_f1(y_pred[self._test_idx], y[self._test_idx]),
+        )
+        self.log(
+            "test_prec",
+            self.test_prec(y_pred[self._test_idx], y[self._test_idx]),
+        )
+        self.log(
+            "test_rec",
+            self.test_rec(y_pred[self._test_idx], y[self._test_idx]),
+        )
+
+        test_acc = self.evaluate(
+            y_pred=y_pred[self._test_idx], y_true=y[self._test_idx]
+        )
+        self.log("test_acc", test_acc)
 
     def configure_optimizers(self):
         optimizer = optim.Adam(
@@ -392,15 +996,26 @@ class LightingFullBatchModelWrapper(pl.LightningModule):
 
 
 def get_model(args):
+    """
+    args is expected to have:
+      - num_features, num_classes
+      - hidden_dim, num_layers, dropout
+      - conv_type ("dir-gcn" or "dir-gcn-gated")
+      - jk, normalize
+      - alpha, learn_alpha
+      - lcs_threshold, enable_lcs_masking  (for enhanced DIR-GCN)
+    """
     return GNN(
         num_features=args.num_features,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         num_classes=args.num_classes,
         dropout=args.dropout,
-        conv_type=args.conv_type,  # "dir-gcn" or "dir-gcn-gated"
+        conv_type=args.conv_type,
         jumping_knowledge=args.jk,
         normalize=args.normalize,
         alpha=args.alpha,
         learn_alpha=args.learn_alpha,
+        lcs_threshold=getattr(args, "lcs_threshold", 0.0),
+        enable_lcs_masking=getattr(args, "enable_lcs_masking", False),
     )

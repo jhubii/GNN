@@ -13,5 +13,9 @@
   "self_loops": false,
   "transpose": false,
   "jk": "max",
-  "normalize": false
+  "normalize": false,
+  "enable_lcs_masking": true,
+  "lcs_threshold": 0.3,
+  "mini_batch_training": true,
+  "mini_batch_size": 1024
 }

@@ -1,0 +1,26 @@
+{
+  "layer_0": {
+    "mp_operation_stats": {
+      "naive_ops": 468710,
+      "actual_ops": 468710,
+      "saved_ops": 0,
+      "saved_ratio": 0.0
+    }
+  },
+  "layer_1": {
+    "mp_operation_stats": {
+      "naive_ops": 468710,
+      "actual_ops": 468710,
+      "saved_ops": 0,
+      "saved_ratio": 0.0
+    }
+  },
+  "layer_2": {
+    "mp_operation_stats": {
+      "naive_ops": 468710,
+      "actual_ops": 468710,
+      "saved_ops": 0,
+      "saved_ratio": 0.0
+    }
+  }
+}

@@ -1,0 +1,65 @@
+{
+  "layer_0": {
+    "recurring_transaction_stats": {
+      "num_edges": 234355,
+      "num_unique_edges": 234355,
+      "num_recurring_edges": 0,
+      "recurring_ratio": 0.0
+    },
+    "lcs_masking_stats": {
+      "num_edges_total": 234355,
+      "num_edges_kept": 206561,
+      "num_edges_pruned": 27794,
+      "pruned_ratio": 0.11859785368351433,
+      "threshold": 0.3
+    },
+    "mp_operation_stats": {
+      "naive_ops": 468710,
+      "actual_ops": 413122,
+      "saved_ops": 55588,
+      "saved_ratio": 0.11859785368351433
+    }
+  },
+  "layer_1": {
+    "recurring_transaction_stats": {
+      "num_edges": 234355,
+      "num_unique_edges": 234355,
+      "num_recurring_edges": 0,
+      "recurring_ratio": 0.0
+    },
+    "lcs_masking_stats": {
+      "num_edges_total": 234355,
+      "num_edges_kept": 234346,
+      "num_edges_pruned": 9,
+      "pruned_ratio": 3.840327707964413e-05,
+      "threshold": 0.3
+    },
+    "mp_operation_stats": {
+      "naive_ops": 468710,
+      "actual_ops": 468692,
+      "saved_ops": 18,
+      "saved_ratio": 3.840327707964413e-05
+    }
+  },
+  "layer_2": {
+    "recurring_transaction_stats": {
+      "num_edges": 234355,
+      "num_unique_edges": 234355,
+      "num_recurring_edges": 0,
+      "recurring_ratio": 0.0
+    },
+    "lcs_masking_stats": {
+      "num_edges_total": 234355,
+      "num_edges_kept": 174171,
+      "num_edges_pruned": 60184,
+      "pruned_ratio": 0.2568069808623669,
+      "threshold": 0.3
+    },
+    "mp_operation_stats": {
+      "naive_ops": 468710,
+      "actual_ops": 348342,
+      "saved_ops": 120368,
+      "saved_ratio": 0.2568069808623669
+    }
+  }
+}

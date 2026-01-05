@@ -11,11 +11,21 @@ import torch
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.loggers import CSVLogger
 
 from src.datasets.data_loading import get_dataset, get_dataset_split
 from src.datasets.dataset import FullBatchGraphDataset
-from src.model import get_model, LightingFullBatchModelWrapper
+from src.model import (
+    get_model,
+    LightingFullBatchModelWrapper,
+    LightingMiniBatchDirGatedWrapper,
+)
 from src.utils.arguments import args  # parsed from CLI
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
 
 
 def make_experiment_id(a) -> str:
@@ -32,6 +42,40 @@ def make_experiment_id(a) -> str:
         return s.replace(".", "p")
 
     return f"hdim{a.hidden_dim}_L{a.num_layers}_drop{f(a.dropout)}_lr{f(a.lr)}"
+
+
+def save_hyperparams(local_args, results_root: str):
+    """Save the hyperparameters for a single config under results_root."""
+    hyperparams = {
+        "dataset": local_args.dataset,
+        "hidden_dim": local_args.hidden_dim,
+        "num_layers": local_args.num_layers,
+        "dropout": local_args.dropout,
+        "lr": local_args.lr,
+        "weight_decay": local_args.weight_decay,
+        "num_epochs": local_args.num_epochs,
+        "num_runs": local_args.num_runs,
+        "alpha": local_args.alpha,
+        "learn_alpha": local_args.learn_alpha,
+        "undirected": local_args.undirected,
+        "self_loops": local_args.self_loops,
+        "transpose": local_args.transpose,
+        "jk": local_args.jk,
+        "normalize": local_args.normalize,
+        "enable_lcs_masking": getattr(local_args, "enable_lcs_masking", False),
+        "lcs_threshold": getattr(local_args, "lcs_threshold", 0.0),
+        "mini_batch_training": getattr(local_args, "mini_batch_training", False),
+        "mini_batch_size": getattr(local_args, "mini_batch_size", 1024),
+    }
+    os.makedirs(results_root, exist_ok=True)
+    with open(os.path.join(results_root, "hyperparams.json"), "w") as f:
+        json.dump(hyperparams, f, indent=2)
+    print(f"Hyperparameters saved to: {os.path.join(results_root, 'hyperparams.json')}")
+
+
+# ============================================================================
+# Diagnostics: confusion / ROC / PR + structural / LCS / MP stats
+# ============================================================================
 
 
 def create_diagnostics_plots(
@@ -51,8 +95,19 @@ def create_diagnostics_plots(
       - ROC curve           (if binary)
       - Precision–Recall    (if binary)
 
+    Also, for each convolution layer (especially the enhanced DIR-GCN),
+    we:
+      - trigger one forward pass on the full graph
+      - read per-layer diagnostics:
+          * recurring_transaction_stats
+          * lcs_masking_stats
+          * mp_operation_stats
+        (and legacy names structural_redundancy / lcs_redundancy_stats)
+      - save them into JSON so they can be used in Chapter 4 tables.
+
     Saved under:
         results_root/plots/<conv_type>/
+        results_root/struct_lcs_stats/<conv_type>_best_run_struct_lcs_stats.json
     """
     import matplotlib.pyplot as plt
     from sklearn.metrics import (
@@ -63,7 +118,6 @@ def create_diagnostics_plots(
     )
 
     # Rebuild the same data split for this run index
-    # same call as during training
     train_mask, val_mask, test_mask = get_dataset_split(
         local_args.dataset, data, local_args.dataset_directory, best_run_idx
     )
@@ -102,7 +156,8 @@ def create_diagnostics_plots(
     y = data.y.long().view(-1).to(device)
 
     with torch.no_grad():
-        logits = model(x, edge_index)  # [N, C]
+        # Full-graph forward for diagnostics
+        logits = model(x, edge_index, batch_nodes=None)  # [N, C]
         probs = torch.softmax(logits, dim=1)
         y_true = y[test_mask].cpu().numpy()
         y_pred = probs.argmax(dim=1)[test_mask].cpu().numpy()
@@ -180,17 +235,81 @@ def create_diagnostics_plots(
     else:
         print(f"Skipping ROC/PR curves for {label} (num_classes={num_classes} > 2).")
 
+    # ------------------------------------------------------------------
+    # Structural / LCS / MP-operation stats for each layer
+    # ------------------------------------------------------------------
+    diagnostics_by_layer = {}
+    if hasattr(model, "convs"):
+        for layer_idx, conv in enumerate(model.convs):
+            layer_key = f"layer_{layer_idx}"
+            layer_stats = {}
+
+            # New names from enhanced DIR-GCN implementation
+            if hasattr(conv, "recurring_transaction_stats"):
+                stats = getattr(conv, "recurring_transaction_stats")
+                if stats:
+                    layer_stats["recurring_transaction_stats"] = stats
+
+            if hasattr(conv, "lcs_masking_stats"):
+                stats = getattr(conv, "lcs_masking_stats")
+                if stats:
+                    layer_stats["lcs_masking_stats"] = stats
+
+            if hasattr(conv, "mp_operation_stats"):
+                stats = getattr(conv, "mp_operation_stats")
+                if stats:
+                    layer_stats["mp_operation_stats"] = stats
+
+            # Legacy names (for backward compatibility)
+            if hasattr(conv, "structural_redundancy"):
+                stats = getattr(conv, "structural_redundancy")
+                if stats:
+                    layer_stats["structural_redundancy"] = stats
+
+            if hasattr(conv, "lcs_redundancy_stats"):
+                stats = getattr(conv, "lcs_redundancy_stats")
+                if stats:
+                    layer_stats["lcs_redundancy_stats"] = stats
+
+            if layer_stats:
+                diagnostics_by_layer[layer_key] = layer_stats
+
+    if diagnostics_by_layer:
+        stats_dir = os.path.join(results_root, "struct_lcs_stats")
+        os.makedirs(stats_dir, exist_ok=True)
+        stats_path = os.path.join(
+            stats_dir, f"{conv_type}_best_run_struct_lcs_stats.json"
+        )
+        with open(stats_path, "w") as f:
+            json.dump(diagnostics_by_layer, f, indent=2)
+        print(f"Saved structural/LCS/MP diagnostics to: {stats_path}")
+    else:
+        print(f"No structural/LCS/MP diagnostics found for {label}.")
+
+
+# ============================================================================
+# Training of a single model type (baseline or enhanced) – full-batch vs mini
+# ============================================================================
+
 
 def run_single_model(base_args, conv_type: str, label: str, results_root: str):
     """
     Train & evaluate a single model type (baseline or enhanced)
     using the SAME hyperparameters from base_args, except conv_type.
 
+    - Baseline (dir-gcn): full-batch training (LightingFullBatchModelWrapper)
+    - Enhanced (dir-gcn-gated):
+        * full-batch if mini_batch_training is False
+        * mini-batch if mini_batch_training is True
+
+    Validation / Test:
+        - full-graph evaluation; train/val/test masks control which nodes
+          contribute to each metric.
+
     All outputs are saved neatly under:
-        results_root/<conv_type>/run_<k>/  (checkpoints, per-run metrics)
+        results_root/<conv_type>/run_<k>/  (checkpoints, per-run metrics, CSV logs)
         results_root/<conv_type>/summary.json
     """
-    # copy args so we don't mutate the original
     local_args = deepcopy(base_args)
     local_args.conv_type = conv_type
 
@@ -201,7 +320,7 @@ def run_single_model(base_args, conv_type: str, label: str, results_root: str):
 
     torch.manual_seed(0)
 
-    # Load dataset once
+    # ---- load dataset once ----
     dataset, evaluator = get_dataset(
         name=local_args.dataset,
         root_dir=local_args.dataset_directory,
@@ -210,11 +329,16 @@ def run_single_model(base_args, conv_type: str, label: str, results_root: str):
         transpose=local_args.transpose,
     )
     data = dataset._data
+
+    # full-batch loader (baseline + enhanced share the same loader;
+    # enhanced mini-batch wrapper samples seed nodes internally)
     data_loader = DataLoader(
-        FullBatchGraphDataset(data), batch_size=1, collate_fn=lambda batch: batch[0]
+        FullBatchGraphDataset(data),
+        batch_size=1,
+        collate_fn=lambda batch: batch[0],
     )
 
-    # Lists to store metrics across runs
+    # metrics storage
     val_scores = []  # best val_f1
     test_accs = []
     test_f1s = []
@@ -225,40 +349,65 @@ def run_single_model(base_args, conv_type: str, label: str, results_root: str):
     test_times = []
     total_times = []
     mem_usages_mb = []
-    best_ckpt_paths = []  # <--- keep path to best checkpoint per run
+    best_ckpt_paths = []  # path to best checkpoint per run
 
     for num_run in range(local_args.num_runs):
         print(
             f"\n---------- {label} | Run {num_run + 1} / {local_args.num_runs} ----------"
         )
 
-        # Same splits for this dataset/run index
+        # same splits for this dataset/run index
         train_mask, val_mask, test_mask = get_dataset_split(
             local_args.dataset, data, local_args.dataset_directory, num_run
         )
 
-        # Build model
+        # ---- build model ----
         local_args.num_features = data.num_features
         local_args.num_classes = dataset.num_classes
 
         model = get_model(local_args)
-        lit_model = LightingFullBatchModelWrapper(
-            model=model,
-            lr=local_args.lr,
-            weight_decay=local_args.weight_decay,
-            evaluator=evaluator,
-            train_mask=train_mask,
-            val_mask=val_mask,
-            test_mask=test_mask,
+
+        # Decide whether to use full-batch or mini-batch wrapper
+        use_mini_batch = conv_type == "dir-gcn-gated" and getattr(
+            local_args, "mini_batch_training", False
         )
 
-        # Folder for this run’s checkpoints & metrics
+        if use_mini_batch:
+            print(
+                f"[INFO] Using mini-batch training for enhanced model with "
+                f"mini_batch_size={getattr(local_args, 'mini_batch_size', 1024)}"
+            )
+            lit_model = LightingMiniBatchDirGatedWrapper(
+                model=model,
+                lr=local_args.lr,
+                weight_decay=local_args.weight_decay,
+                evaluator=evaluator,
+                train_mask=train_mask,
+                val_mask=val_mask,
+                test_mask=test_mask,
+                mini_batch_size=getattr(local_args, "mini_batch_size", 1024),
+            )
+        else:
+            lit_model = LightingFullBatchModelWrapper(
+                model=model,
+                lr=local_args.lr,
+                weight_decay=local_args.weight_decay,
+                evaluator=evaluator,
+                train_mask=train_mask,
+                val_mask=val_mask,
+                test_mask=test_mask,
+            )
+
+        # folder for this run’s checkpoints + logs
         run_root = os.path.join(model_results_dir, f"run_{num_run + 1}")
         os.makedirs(run_root, exist_ok=True)
 
-        # Callbacks: early stopping + checkpoint on val_f1
+        # callbacks: early stopping + checkpoint on val_f1
         early_stopping_callback = EarlyStopping(
-            monitor="val_f1", mode="max", patience=local_args.patience
+            monitor="val_f1",
+            mode="max",
+            patience=local_args.patience,
+            check_on_train_epoch_end=True,
         )
 
         ckpt_dir = os.path.join(run_root, str(uuid.uuid4()))
@@ -270,6 +419,12 @@ def run_single_model(base_args, conv_type: str, label: str, results_root: str):
             dirpath=ckpt_dir,
         )
 
+        # CSV logger = "snapshot during training phase"
+        csv_logger = CSVLogger(
+            save_dir=run_root,
+            name="logs",
+        )
+
         trainer = pl.Trainer(
             log_every_n_steps=1,
             max_epochs=local_args.num_epochs,
@@ -277,39 +432,42 @@ def run_single_model(base_args, conv_type: str, label: str, results_root: str):
             profiler="simple" if local_args.profiler else None,
             accelerator="cpu",
             devices=1,
-            enable_model_summary=False,  # avoid huge model table logs
+            enable_model_summary=False,
+            logger=csv_logger,
         )
 
-        # Training time
+        # ---------- train ----------
         t0_train = time.perf_counter()
-        trainer.fit(model=lit_model, train_dataloaders=data_loader)
+        trainer.fit(
+            model=lit_model,
+            train_dataloaders=data_loader,
+        )
         t1_train = time.perf_counter()
         train_time = t1_train - t0_train
 
-        # Best validation F1
+        # best validation F1
         best_val_f1 = model_checkpoint_callback.best_model_score.item()
         best_ckpt_path = model_checkpoint_callback.best_model_path
         best_ckpt_paths.append(best_ckpt_path)
 
-        # Test time
+        # ---------- test ----------
         t0_test = time.perf_counter()
         test_results = trainer.test(ckpt_path="best", dataloaders=data_loader)[0]
         t1_test = time.perf_counter()
         test_time = t1_test - t0_test
         total_time = train_time + test_time
 
-        # Memory usage
+        # memory usage (snapshot at end of run)
         process = psutil.Process(os.getpid())
         mem_bytes = process.memory_info().rss
         mem_mb = mem_bytes / (1024**2)
 
-        # Extract metrics
+        # metrics
         test_acc = float(test_results.get("test_acc", 0.0))
         test_f1 = float(test_results.get("test_f1", 0.0))
         test_prec = float(test_results.get("test_prec", 0.0))
         test_rec = float(test_results.get("test_rec", 0.0))
 
-        # Store
         val_scores.append(best_val_f1)
         test_accs.append(test_acc)
         test_f1s.append(test_f1)
@@ -320,7 +478,6 @@ def run_single_model(base_args, conv_type: str, label: str, results_root: str):
         total_times.append(total_time)
         mem_usages_mb.append(mem_mb)
 
-        # Per-run summary (printed)
         print(f"Best Val F1-score : {best_val_f1:.4f}")
         print(f"Test Accuracy     : {test_acc:.4f}")
         print(f"Test F1-score     : {test_f1:.4f}")
@@ -331,7 +488,6 @@ def run_single_model(base_args, conv_type: str, label: str, results_root: str):
         print(f"Total time (s)    : {total_time:.2f}")
         print(f"Memory usage (MB) : {mem_mb:.2f}")
 
-        # Save per-run metrics JSON
         run_metrics = {
             "run_index": num_run + 1,
             "best_val_f1": best_val_f1,
@@ -347,7 +503,7 @@ def run_single_model(base_args, conv_type: str, label: str, results_root: str):
         with open(os.path.join(run_root, "metrics_run.json"), "w") as f:
             json.dump(run_metrics, f, indent=2)
 
-    # Aggregate
+    # ------ aggregate ------
     def summarize(values):
         v = np.array(values, dtype=float)
         return v.mean(), v.std()
@@ -366,7 +522,6 @@ def run_single_model(base_args, conv_type: str, label: str, results_root: str):
         "num_runs": int(local_args.num_runs),
     }
 
-    # Print final summary
     print(f"\n===== {label} FINAL SUMMARY over {local_args.num_runs} runs =====")
     for key in [
         "val_f1",
@@ -382,19 +537,19 @@ def run_single_model(base_args, conv_type: str, label: str, results_root: str):
         mean, std = results[key]
         print(f"{key:15s}: {mean:.4f} ± {std:.4f}")
 
-    # Save summary JSON for this model
+    # summary.json
     summary_path = os.path.join(model_results_dir, "summary.json")
     serializable = {
         k: (float(v[0]), float(v[1])) if isinstance(v, tuple) else v
         for k, v in results.items()
-        if k not in ("label",)
+        if k != "label"
     }
     serializable["label"] = label
     with open(summary_path, "w") as f:
         json.dump(serializable, f, indent=2)
     print(f"Saved {label} summary to: {summary_path}")
 
-    # ---------------- Diagnostics plots for best run ----------------
+    # ----- diagnostics & redundancy stats on best run -----
     best_run_idx = int(np.argmax(np.array(val_scores)))
     best_ckpt_path = best_ckpt_paths[best_run_idx]
 
@@ -416,130 +571,135 @@ def run_single_model(base_args, conv_type: str, label: str, results_root: str):
     return results
 
 
-def plot_comparison(
-    baseline_results,
-    enhanced_results,
+# ============================================================================
+# Overall plots vs Config (C1–C4)
+# ============================================================================
+
+
+def plot_overall_by_config(
     dataset_name: str,
-    results_root: str,
-    exp_id: str,
+    config_ids,
+    baseline_by_cfg,
+    enhanced_by_cfg,
+    out_root: str,
 ):
-    """Simple bar chart comparing Accuracy, F1, Precision, Recall."""
     import matplotlib.pyplot as plt
 
-    metrics = ["test_acc", "test_f1", "test_prec", "test_rec"]
-    labels = ["Accuracy", "F1-score", "Precision", "Recall"]
+    os.makedirs(out_root, exist_ok=True)
 
-    baseline_vals = [baseline_results[m][0] for m in metrics]  # means
-    enhanced_vals = [enhanced_results[m][0] for m in metrics]  # means
+    metric_specs = [
+        (
+            "mem_mb",
+            "Memory Usage vs Config",
+            "Memory Usage (MB)",
+            "memory_by_config.png",
+        ),
+        (
+            "total_time",
+            "Total Time vs Config",
+            "Total Time (s)",
+            "total_time_by_config.png",
+        ),
+        ("val_f1", "Best Validation F1 vs Config", "Score", "val_f1_by_config.png"),
+        ("test_acc", "Test Accuracy vs Config", "Score", "test_acc_by_config.png"),
+        ("test_f1", "Test F1-score vs Config", "Score", "test_f1_by_config.png"),
+        ("test_prec", "Test Precision vs Config", "Score", "test_prec_by_config.png"),
+        ("test_rec", "Test Recall vs Config", "Score", "test_rec_by_config.png"),
+    ]
 
-    x = np.arange(len(labels))
+    x = np.arange(len(config_ids))
     width = 0.35
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.bar(x - width / 2, baseline_vals, width, label=baseline_results["label"])
-    ax.bar(x + width / 2, enhanced_vals, width, label=enhanced_results["label"])
+    for key, title, ylabel, fname in metric_specs:
+        baseline_vals = [baseline_by_cfg[cid][key][0] for cid in config_ids]
+        enhanced_vals = [enhanced_by_cfg[cid][key][0] for cid in config_ids]
 
-    ax.set_ylabel("Score")
-    ax.set_title(f"Dir-GCN vs Enhanced Dir-GCN ({dataset_name}, {exp_id})")
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels)
-    ax.set_ylim(0.0, 1.0)
-    ax.legend()
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.bar(x - width / 2, baseline_vals, width, label="Baseline Dir-GCN")
+        ax.bar(x + width / 2, enhanced_vals, width, label="Enhanced Dir-GCN (Gated)")
 
-    fig.tight_layout()
+        ax.set_title(f"{title} ({dataset_name})")
+        ax.set_xlabel("Config")
+        ax.set_ylabel(ylabel)
+        ax.set_xticks(x)
+        ax.set_xticklabels(config_ids)
+        if key not in ("mem_mb", "total_time"):
+            ax.set_ylim(0.0, 1.0)
+        ax.legend()
 
-    plots_dir = os.path.join(results_root, "plots")
-    os.makedirs(plots_dir, exist_ok=True)
-    out_path = os.path.join(
-        plots_dir, f"compare_{dataset_name}_{exp_id}_dirgcn_vs_enhanced.png"
-    )
-    plt.savefig(out_path, dpi=200)
-    print(f"\nSaved comparison plot to: {out_path}")
+        fig.tight_layout()
+        out_path = os.path.join(out_root, fname)
+        plt.savefig(out_path, dpi=200)
+        plt.close(fig)
+        print(f"Saved overall {key} plot to: {out_path}")
+
+
+# ============================================================================
+# Main – run all configs (C1–C4) in one go
+# ============================================================================
 
 
 if __name__ == "__main__":
-    # Build experiment ID from hyperparameters so each setting is separate
-    exp_id = make_experiment_id(args)
+    # All configs we want to sweep over (C1–C4)
+    CONFIGS = [
+        ("C1", dict(hidden_dim=32, num_layers=3, dropout=0.5, lr=0.001)),
+        ("C2", dict(hidden_dim=32, num_layers=3, dropout=0.6, lr=0.0005)),
+        ("C3", dict(hidden_dim=64, num_layers=3, dropout=0.5, lr=0.001)),
+        ("C4", dict(hidden_dim=64, num_layers=3, dropout=0.6, lr=0.0005)),
+    ]
 
-    # Root folder for everything related to this dataset + hyperparams
-    results_root = os.path.join("results", args.dataset, exp_id)
-    os.makedirs(results_root, exist_ok=True)
+    dataset_root = os.path.join("results", args.dataset)
+    os.makedirs(dataset_root, exist_ok=True)
 
-    # Save hyperparameters for this experiment
-    hyperparams = {
-        "dataset": args.dataset,
-        "hidden_dim": args.hidden_dim,
-        "num_layers": args.num_layers,
-        "dropout": args.dropout,
-        "lr": args.lr,
-        "weight_decay": args.weight_decay,
-        "num_epochs": args.num_epochs,
-        "num_runs": args.num_runs,
-        "alpha": args.alpha,
-        "learn_alpha": args.learn_alpha,
-        "undirected": args.undirected,
-        "self_loops": args.self_loops,
-        "transpose": args.transpose,
-        "jk": args.jk,
-        "normalize": args.normalize,
-    }
-    with open(os.path.join(results_root, "hyperparams.json"), "w") as f:
-        json.dump(hyperparams, f, indent=2)
-    print(f"Experiment ID: {exp_id}")
-    print(f"Hyperparameters saved to: {os.path.join(results_root, 'hyperparams.json')}")
+    baseline_by_cfg = {}
+    enhanced_by_cfg = {}
 
-    # Baseline Dir-GCN
-    baseline_results = run_single_model(
-        base_args=args,
-        conv_type="dir-gcn",
-        label="Baseline Dir-GCN",
-        results_root=results_root,
-    )
+    for cfg_id, cfg_params in CONFIGS:
+        print("\n" + "=" * 80)
+        print(f"Running config {cfg_id}: {cfg_params}")
+        print("=" * 80)
 
-    # Enhanced Dir-GCN (gated)
-    enhanced_results = run_single_model(
-        base_args=args,
-        conv_type="dir-gcn-gated",
-        label="Enhanced Dir-GCN (Gated)",
-        results_root=results_root,
-    )
+        # Clone CLI args and override with config-specific hyperparams
+        local_args = deepcopy(args)
+        local_args.hidden_dim = cfg_params["hidden_dim"]
+        local_args.num_layers = cfg_params["num_layers"]
+        local_args.dropout = cfg_params["dropout"]
+        local_args.lr = cfg_params["lr"]
 
-    # Print a compact side-by-side summary
-    print("\n================ OVERALL COMPARISON ================")
-    comparison_summary = {}
-    for name, key in [
-        ("Val F1 (best)", "val_f1"),
-        ("Test Acc      ", "test_acc"),
-        ("Test F1       ", "test_f1"),
-        ("Test Prec     ", "test_prec"),
-        ("Test Rec      ", "test_rec"),
-        ("Train time (s)", "train_time"),
-        ("Total time (s)", "total_time"),
-        ("Mem usage (MB)", "mem_mb"),
-    ]:
-        b_mean, b_std = baseline_results[key]
-        e_mean, e_std = enhanced_results[key]
-        print(
-            f"{name}: "
-            f"Baseline = {b_mean:.4f} ± {b_std:.4f} | "
-            f"Enhanced = {e_mean:.4f} ± {e_std:.4f}"
+        exp_id = make_experiment_id(local_args)
+        results_root_cfg = os.path.join(dataset_root, exp_id)
+        print(f"Experiment ID ({cfg_id}): {exp_id}")
+
+        save_hyperparams(local_args, results_root_cfg)
+
+        # Baseline Dir-GCN (always full-batch)
+        baseline_results = run_single_model(
+            base_args=local_args,
+            conv_type="dir-gcn",
+            label=f"Baseline Dir-GCN ({cfg_id})",
+            results_root=results_root_cfg,
         )
-        comparison_summary[key] = {
-            "baseline": {"mean": float(b_mean), "std": float(b_std)},
-            "enhanced": {"mean": float(e_mean), "std": float(e_std)},
-        }
 
-    # Save overall comparison JSON
-    comparison_path = os.path.join(results_root, "comparison_summary.json")
-    with open(comparison_path, "w") as f:
-        json.dump(comparison_summary, f, indent=2)
-    print(f"\nSaved overall comparison summary to: {comparison_path}")
+        # Enhanced Dir-GCN (gated) – full-batch or mini-batch depending on flags
+        enhanced_results = run_single_model(
+            base_args=local_args,
+            conv_type="dir-gcn-gated",
+            label=f"Enhanced Dir-GCN (Gated, {cfg_id})",
+            results_root=results_root_cfg,
+        )
 
-    # Plot bar chart for this hyperparameter setting
-    plot_comparison(
-        baseline_results,
-        enhanced_results,
+        baseline_by_cfg[cfg_id] = baseline_results
+        enhanced_by_cfg[cfg_id] = enhanced_results
+
+    # After ALL configs are done, create overall plots vs config
+    overall_root = os.path.join(dataset_root, "overall")
+    config_ids = [cid for cid, _ in CONFIGS]
+    plot_overall_by_config(
         dataset_name=args.dataset,
-        results_root=results_root,
-        exp_id=exp_id,
+        config_ids=config_ids,
+        baseline_by_cfg=baseline_by_cfg,
+        enhanced_by_cfg=enhanced_by_cfg,
+        out_root=overall_root,
     )
+
+    print("\nAll configs finished. Overall plots saved under:", overall_root)
