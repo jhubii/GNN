@@ -125,7 +125,9 @@ dataset_name = DATASETS[dataset_label]
 conv_type = MODELS[model_label]
 exp_id = get_exp_id(config)
 
-base_dir = Path("results") / dataset_name / exp_id
+dataset_root = Path("results") / dataset_name
+base_dir = dataset_root / exp_id
+overall_dir = dataset_root / "overall"
 
 # ============================================================
 # Current selection info
@@ -376,3 +378,37 @@ else:
         "Tip: Open the downloaded CSV directly in Excel or any spreadsheet tool "
         "to filter, sort, and further analyze the predictions."
     )
+
+st.markdown("---")
+
+# ============================================================
+# SECTION 5 – Overall Comparison Across Configs (dataset /overall)
+# ============================================================
+
+st.header("Overall Comparison Across Configs (Dataset-level)")
+
+st.write(
+    "These plots summarize **Baseline Dir-GCN vs Enhanced Dir-GCN (Gated)** "
+    "across all configurations (C1–C4) for the selected dataset. "
+    "They come from `results/<dataset>/overall/`."
+)
+
+overall_plots = [
+    ("val_f1_by_config.png", "Best Validation F1 vs Config"),
+    ("test_acc_by_config.png", "Test Accuracy vs Config"),
+    ("test_f1_by_config.png", "Test F1-score vs Config"),
+    ("test_prec_by_config.png", "Test Precision vs Config"),
+    ("test_rec_by_config.png", "Test Recall vs Config"),
+    ("memory_by_config.png", "Memory Usage vs Config"),
+    ("total_time_by_config.png", "Total Time vs Config"),
+]
+
+if not overall_dir.exists():
+    st.info(f"No `overall` directory found at `{overall_dir}` yet.")
+else:
+    for fname, title in overall_plots:
+        img_path = overall_dir / fname
+        if img_path.exists():
+            st.subheader(title)
+            st.image(str(img_path), use_container_width=True)
+        # if a specific file doesn't exist, we just skip it silently
