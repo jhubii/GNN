@@ -1,4 +1,5 @@
 import json
+import io
 from pathlib import Path
 
 import streamlit as st
@@ -96,17 +97,17 @@ st.write(f"- **Configuration**: `{config}` → `{exp_id}`")
 st.write(f"- **Model**: `{model_label}` (`{conv_type}`)")
 st.write(f"- **Base directory**: `{base_dir}`")
 
-# ====== Metric table ======
+# ====== Metric table (Problem 1 & 2: performance vs resource usage) ======
 comparison_path = base_dir / "comparison_summary.json"
 comparison_data = load_json(comparison_path)
 
 if comparison_data is None:
     st.error(f"No comparison_summary.json found at {comparison_path}")
 else:
-    st.subheader("Metric Comparison (Baseline vs Enhanced)")
+    st.subheader("Problem 1 & 2 – Metric Comparison (Baseline vs Enhanced)")
     render_metrics_table(comparison_data)
 
-    # 🟥 Comparison bar graph (the one you said is missing)
+    # Comparison bar graph (overall metrics)
     maybe_show_comparison_bar(base_dir, dataset_name, exp_id)
 
     st.markdown("---")
@@ -168,63 +169,129 @@ else:
 
 st.markdown("---")
 
-# ====== Node-level Prediction (using precomputed JSON) ======
-st.header("Node-level Fraud Prediction")
+# ====== Problem 3 – Redundancy vs Reuse (Solution 3 metrics) ======
+st.header("Problem 3 – Redundant Computation vs Reuse (Solution 3)")
 
-st.write(
-    "Use this panel to inspect the model's prediction for a specific node "
-    "(account / address / transaction entity), including its predicted class "
-    "and fraud probability."
+p3_csv_path = (
+    base_dir / "problem3_metrics" / f"{conv_type}_best_run_problem3_metrics.csv"
+)
+p3_summary_path = (
+    base_dir / "problem3_metrics" / f"{conv_type}_best_run_problem3_summary.json"
 )
 
-predictions_path = base_dir / "predictions" / f"{conv_type}_node_predictions.json"
-predictions = load_json(predictions_path)
+if p3_csv_path.exists():
+    st.subheader("Per-layer Redundancy / Aggregation Metrics")
+    p3_df = pd.read_csv(p3_csv_path)
+    st.dataframe(p3_df, use_container_width=True)
+else:
+    st.info(
+        f"No Problem 3 metrics CSV found at {p3_csv_path}. "
+        "Make sure create_diagnostics_plots generated it."
+    )
 
-if predictions is None:
+p3_summary = load_json(p3_summary_path)
+if p3_summary is not None:
+    st.subheader("Summary (Aggregation Savings & Cache Hit Ratio)")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric(
+            "Total Saved Aggregations Ratio",
+            f"{p3_summary.get('total_saved_ratio', 0.0):.4f}",
+        )
+    with col2:
+        st.metric(
+            "Global Cache Hit Ratio",
+            f"{p3_summary.get('global_cache_hit_ratio', 0.0):.4f}",
+        )
+    with col3:
+        st.metric(
+            "Total Recurring Edges",
+            f"{p3_summary.get('total_recurring_edges', 0)}",
+        )
+
+# ====== Inference Runtime (Scope 2.5) ======
+st.markdown("---")
+st.header("Inference Runtime (Deployment Efficiency)")
+
+runtime_path = base_dir / "runtime" / f"{conv_type}_best_run_inference_runtime.json"
+runtime_data = load_json(runtime_path)
+
+if runtime_data is None:
     st.warning(
-        f"No prediction file found at {predictions_path}. "
-        "Run export_predictions.py locally and commit the JSON files."
+        f"No runtime file found at {runtime_path}. "
+        "Make sure measure_inference_time exported it."
     )
 else:
-    # Determine valid range
-    node_ids = sorted(int(k) for k in predictions.keys())
-    min_id, max_id = node_ids[0], node_ids[-1]
-
-    node_id = st.number_input(
-        "Node ID",
-        min_value=min_id,
-        max_value=max_id,
-        value=min_id,
-        step=1,
-        help=f"Valid node indices: {min_id} to {max_id}",
+    avg_t = float(runtime_data.get("avg_inference_time_seconds", 0.0))
+    st.write(
+        f"- **Selected Model**: `{conv_type}`  \n"
+        f"- **Average Inference Time (full-graph forward)**: `{avg_t:.6f}` seconds"
     )
 
-    if st.button("Show Prediction"):
-        key = str(node_id)
-        if key not in predictions:
-            st.error(f"Node ID {node_id} not found in predictions.")
-        else:
-            rec = predictions[key]
-            y_pred = rec.get("y_pred", None)
-            y_true = rec.get("y_true", None)
-            p0 = rec.get("p0", None)
-            p1 = rec.get("p1", None)
+    # If both baseline & enhanced runtimes exist, show speedup (×)
+    baseline_rt_path = base_dir / "runtime" / "dir-gcn_best_run_inference_runtime.json"
+    enhanced_rt_path = (
+        base_dir / "runtime" / "dir-gcn-gated_best_run_inference_runtime.json"
+    )
 
-            st.subheader("Prediction Result")
-            st.write(f"- **Node ID**: `{node_id}`")
+    baseline_rt = load_json(baseline_rt_path)
+    enhanced_rt = load_json(enhanced_rt_path)
 
-            if y_pred is not None:
-                st.write(
-                    f"- **Predicted Class**: `{y_pred}` (0 = non-fraud, 1 = fraud)"
-                )
+    if baseline_rt is not None and enhanced_rt is not None:
+        b_t = float(baseline_rt.get("avg_inference_time_seconds", 0.0))
+        e_t = float(enhanced_rt.get("avg_inference_time_seconds", 0.0))
+        if b_t > 0 and e_t > 0:
+            speedup = b_t / e_t
+            st.write(
+                f"- **Baseline Runtime**: `{b_t:.6f}` s  \n"
+                f"- **Enhanced Runtime**: `{e_t:.6f}` s  \n"
+                f"- **Inference Speedup (Baseline ÷ Enhanced)**: `{speedup:.2f}×`"
+            )
 
-            if (p0 is not None) and (p1 is not None):
-                st.write(
-                    f"- **P(non-fraud)**: `{p0:.4f}`  \n- **P(fraud)**: `{p1:.4f}`"
-                )
+# ====== Node-level Prediction (full table + export) ======
+st.markdown("---")
+st.header("Prediction Results – Full Node Table")
 
-            if y_true is not None:
-                if y_true == -1:
-                    st.write("- **True Label**: `unlabeled` (no ground-truth provided)")
-                else:
-                    st.write(f"- **True Label**: `{y_true}` (0 = non-fraud, 1 = fraud)")
+st.write(
+    "This table shows the prediction results for **all nodes** in the dataset "
+    "for the selected model and configuration. You can also export the results "
+    "to CSV or Excel for documentation."
+)
+
+# New: use the CSV exported by export_node_predictions(...)
+predictions_csv_path = (
+    base_dir / "predictions" / f"{conv_type}_best_run_predictions.csv"
+)
+
+if not predictions_csv_path.exists():
+    st.warning(
+        f"No prediction CSV found at {predictions_csv_path}. "
+        "Make sure export_node_predictions was called in create_diagnostics_plots."
+    )
+else:
+    df_preds = pd.read_csv(predictions_csv_path)
+
+    st.subheader("Node-level Predictions")
+    st.dataframe(df_preds, use_container_width=True)
+
+    # --- Download as CSV ---
+    csv_data = df_preds.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="⬇️ Download Predictions as CSV",
+        data=csv_data,
+        file_name=f"{dataset_name}_{conv_type}_predictions.csv",
+        mime="text/csv",
+    )
+
+    # --- Download as Excel ---
+    excel_buffer = io.BytesIO()
+    with pd.ExcelWriter(excel_buffer, engine="xlsxwriter") as writer:
+        df_preds.to_excel(writer, index=False, sheet_name="Predictions")
+    excel_buffer.seek(0)
+
+    st.download_button(
+        label="⬇️ Download Predictions as Excel",
+        data=excel_buffer,
+        file_name=f"{dataset_name}_{conv_type}_predictions.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
