@@ -32,6 +32,10 @@ def load_json(path: Path):
 
 
 def render_metrics_table(comparison_json: dict):
+    """
+    Render baseline vs enhanced metrics for the current config.
+    Returns the DataFrame so we can allow CSV/Excel download.
+    """
     rows = []
     for metric, values in comparison_json.items():
         rows.append(
@@ -45,6 +49,7 @@ def render_metrics_table(comparison_json: dict):
         )
     df = pd.DataFrame(rows)
     st.dataframe(df, use_container_width=True)
+    return df
 
 
 def get_exp_id(config: str) -> str:
@@ -97,27 +102,53 @@ st.write(f"- **Configuration**: `{config}` → `{exp_id}`")
 st.write(f"- **Model**: `{model_label}` (`{conv_type}`)")
 st.write(f"- **Base directory**: `{base_dir}`")
 
-# ====== Metric table (Problem 1 & 2: performance vs resource usage) ======
+st.markdown("---")
+
+# ======================================================================
+# SECTION 1: Problem 1 vs Solution 1 – Classification Performance
+# ======================================================================
+
+st.header("Problem 1 vs Solution 1 – Classification Performance")
+
 comparison_path = base_dir / "comparison_summary.json"
 comparison_data = load_json(comparison_path)
 
 if comparison_data is None:
     st.error(f"No comparison_summary.json found at {comparison_path}")
 else:
-    st.subheader("Problem 1 & 2 – Metric Comparison (Baseline vs Enhanced)")
-    render_metrics_table(comparison_data)
+    st.subheader("Metric Comparison (Baseline vs Enhanced)")
+    metrics_df = render_metrics_table(comparison_data)
 
-    # Comparison bar graph (overall metrics)
+    # Download buttons for metrics
+    col_m1, col_m2 = st.columns(2)
+    with col_m1:
+        csv_bytes = metrics_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="Download Metric Comparison (CSV)",
+            data=csv_bytes,
+            file_name=f"{dataset_name}_{exp_id}_metric_comparison.csv",
+            mime="text/csv",
+        )
+    with col_m2:
+        xls_buf = io.BytesIO()
+        metrics_df.to_excel(xls_buf, index=False, sheet_name="metrics")
+        xls_buf.seek(0)
+        st.download_button(
+            label="Download Metric Comparison (Excel)",
+            data=xls_buf,
+            file_name=f"{dataset_name}_{exp_id}_metric_comparison.xlsx",
+            mime=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        )
+
+    # Overall comparison bar graph
     maybe_show_comparison_bar(base_dir, dataset_name, exp_id)
 
-    st.markdown("---")
-    st.subheader("Diagnostic Plots")
-
+    st.markdown("#### Diagnostic Plots (Per Model)")
     cols = st.columns(2)
 
     # Left column: Baseline Dir-GCN
     with cols[0]:
-        st.markdown("#### Baseline Dir-GCN")
+        st.markdown("##### Baseline Dir-GCN")
 
         roc_baseline = base_dir / "plots" / "dir-gcn" / "dir-gcn_best_run_roc_curve.png"
         if roc_baseline.exists():
@@ -138,7 +169,7 @@ else:
 
     # Right column: Enhanced Dir-GCN (Gated)
     with cols[1]:
-        st.markdown("#### Enhanced Dir-GCN (Gated)")
+        st.markdown("##### Enhanced Dir-GCN (Gated)")
 
         roc_enh = (
             base_dir
@@ -169,8 +200,87 @@ else:
 
 st.markdown("---")
 
-# ====== Problem 3 – Redundancy vs Reuse (Solution 3 metrics) ======
-st.header("Problem 3 – Redundant Computation vs Reuse (Solution 3)")
+# ======================================================================
+# SECTION 2: Problem 2 vs Solution 2 – Time, Memory, Runtime
+# ======================================================================
+
+st.header("Problem 2 vs Solution 2 – Time, Memory, Runtime")
+
+# We assume per-model summary.json exists at:
+#   base_dir/<conv_type>/summary.json
+summary_path = base_dir / conv_type / "summary.json"
+summary_data = load_json(summary_path)
+
+if summary_data is None:
+    st.warning(f"No summary.json found for this model at {summary_path}")
+else:
+    # Extract the metrics we care about: train_time, test_time, total_time, mem_mb
+    rows = []
+    for metric_key in ["train_time", "test_time", "total_time", "mem_mb"]:
+        if metric_key in summary_data:
+            mean, std = summary_data[metric_key]
+            rows.append(
+                {
+                    "Metric": metric_key,
+                    "Mean": mean,
+                    "Std": std,
+                }
+            )
+    if rows:
+        time_mem_df = pd.DataFrame(rows)
+        st.subheader("Training / Testing Time and Memory (selected model)")
+        st.dataframe(time_mem_df, use_container_width=True)
+
+        col_tm1, col_tm2 = st.columns(2)
+        with col_tm1:
+            csv_bytes = time_mem_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="Download Time & Memory Metrics (CSV)",
+                data=csv_bytes,
+                file_name=f"{dataset_name}_{exp_id}_{conv_type}_time_mem.csv",
+                mime="text/csv",
+            )
+        with col_tm2:
+            xls_buf = io.BytesIO()
+            time_mem_df.to_excel(xls_buf, index=False, sheet_name="time_mem")
+            xls_buf.seek(0)
+            st.download_button(
+                label="Download Time & Memory Metrics (Excel)",
+                data=xls_buf,
+                file_name=f"{dataset_name}_{exp_id}_{conv_type}_time_mem.xlsx",
+                mime=(
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                ),
+            )
+
+# Inference runtime (Solution 2.5 / 2.6, also linked to Solution 3)
+runtime_path = base_dir / "runtime" / f"{conv_type}_best_run_inference_runtime.json"
+runtime_data = load_json(runtime_path)
+
+st.subheader("Inference Runtime (Full-Graph Inference)")
+
+if runtime_data is None:
+    st.warning(
+        f"No inference runtime file found at {runtime_path}. "
+        "Make sure create_diagnostics_plots ran for this config."
+    )
+else:
+    avg_time = runtime_data.get("avg_inference_time_seconds", None)
+    if avg_time is not None:
+        ms = avg_time * 1000.0
+        st.metric(
+            label="Average Inference Time per Forward Pass",
+            value=f"{avg_time:.4f} s",
+            delta=f"{ms:.2f} ms",
+        )
+
+st.markdown("---")
+
+# ======================================================================
+# SECTION 3: Problem 3 vs Solution 3 – Redundancy & Caching Metrics
+# ======================================================================
+
+st.header("Problem 3 vs Solution 3 – Recurring Transactions & Caching")
 
 p3_csv_path = (
     base_dir / "problem3_metrics" / f"{conv_type}_best_run_problem3_metrics.csv"
@@ -179,86 +289,67 @@ p3_summary_path = (
     base_dir / "problem3_metrics" / f"{conv_type}_best_run_problem3_summary.json"
 )
 
-if p3_csv_path.exists():
-    st.subheader("Per-layer Redundancy / Aggregation Metrics")
-    p3_df = pd.read_csv(p3_csv_path)
-    st.dataframe(p3_df, use_container_width=True)
-else:
-    st.info(
-        f"No Problem 3 metrics CSV found at {p3_csv_path}. "
-        "Make sure create_diagnostics_plots generated it."
+if not p3_csv_path.exists():
+    st.warning(
+        f"No Problem 3 metrics CSV found for this model at {p3_csv_path}. "
+        "These are generated by create_diagnostics_plots(...)."
     )
+else:
+    p3_df = pd.read_csv(p3_csv_path)
+    st.subheader("Per-Layer Aggregation & Caching Metrics")
+    st.dataframe(p3_df, use_container_width=True)
 
+    col_p3_1, col_p3_2 = st.columns(2)
+    with col_p3_1:
+        csv_bytes = p3_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="Download Problem 3 Metrics (CSV)",
+            data=csv_bytes,
+            file_name=f"{dataset_name}_{exp_id}_{conv_type}_problem3_metrics.csv",
+            mime="text/csv",
+        )
+    with col_p3_2:
+        xls_buf = io.BytesIO()
+        p3_df.to_excel(xls_buf, index=False, sheet_name="problem3")
+        xls_buf.seek(0)
+        st.download_button(
+            label="Download Problem 3 Metrics (Excel)",
+            data=xls_buf,
+            file_name=f"{dataset_name}_{exp_id}_{conv_type}_problem3_metrics.xlsx",
+            mime=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        )
+
+    # Quick visual on cache hit ratio or saved_ratio if available
+    numeric_cols = []
+    for col in ["saved_ratio", "cache_hit_ratio"]:
+        if col in p3_df.columns:
+            numeric_cols.append(col)
+    if numeric_cols:
+        st.markdown("##### Problem 3 Key Ratios (per layer)")
+        st.bar_chart(p3_df.set_index("layer_idx")[numeric_cols])
+
+# Summary JSON for global cache hit ratio, total saved aggregations, etc.
 p3_summary = load_json(p3_summary_path)
 if p3_summary is not None:
-    st.subheader("Summary (Aggregation Savings & Cache Hit Ratio)")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric(
-            "Total Saved Aggregations Ratio",
-            f"{p3_summary.get('total_saved_ratio', 0.0):.4f}",
-        )
-    with col2:
-        st.metric(
-            "Global Cache Hit Ratio",
-            f"{p3_summary.get('global_cache_hit_ratio', 0.0):.4f}",
-        )
-    with col3:
-        st.metric(
-            "Total Recurring Edges",
-            f"{p3_summary.get('total_recurring_edges', 0)}",
-        )
+    st.subheader("Problem 3 Global Summary")
+    summary_rows = [{"Metric": k, "Value": v} for k, v in p3_summary.items()]
+    summary_df = pd.DataFrame(summary_rows)
+    st.dataframe(summary_df, use_container_width=True)
 
-# ====== Inference Runtime (Scope 2.5) ======
 st.markdown("---")
-st.header("Inference Runtime (Deployment Efficiency)")
 
-runtime_path = base_dir / "runtime" / f"{conv_type}_best_run_inference_runtime.json"
-runtime_data = load_json(runtime_path)
+# ======================================================================
+# SECTION 4: Prediction Results – Full Table + Export
+# ======================================================================
 
-if runtime_data is None:
-    st.warning(
-        f"No runtime file found at {runtime_path}. "
-        "Make sure measure_inference_time exported it."
-    )
-else:
-    avg_t = float(runtime_data.get("avg_inference_time_seconds", 0.0))
-    st.write(
-        f"- **Selected Model**: `{conv_type}`  \n"
-        f"- **Average Inference Time (full-graph forward)**: `{avg_t:.6f}` seconds"
-    )
-
-    # If both baseline & enhanced runtimes exist, show speedup (×)
-    baseline_rt_path = base_dir / "runtime" / "dir-gcn_best_run_inference_runtime.json"
-    enhanced_rt_path = (
-        base_dir / "runtime" / "dir-gcn-gated_best_run_inference_runtime.json"
-    )
-
-    baseline_rt = load_json(baseline_rt_path)
-    enhanced_rt = load_json(enhanced_rt_path)
-
-    if baseline_rt is not None and enhanced_rt is not None:
-        b_t = float(baseline_rt.get("avg_inference_time_seconds", 0.0))
-        e_t = float(enhanced_rt.get("avg_inference_time_seconds", 0.0))
-        if b_t > 0 and e_t > 0:
-            speedup = b_t / e_t
-            st.write(
-                f"- **Baseline Runtime**: `{b_t:.6f}` s  \n"
-                f"- **Enhanced Runtime**: `{e_t:.6f}` s  \n"
-                f"- **Inference Speedup (Baseline ÷ Enhanced)**: `{speedup:.2f}×`"
-            )
-
-# ====== Node-level Prediction (full table + export) ======
-st.markdown("---")
-st.header("Prediction Results – Full Node Table")
+st.header("Prediction Results (All Nodes)")
 
 st.write(
-    "This table shows the prediction results for **all nodes** in the dataset "
-    "for the selected model and configuration. You can also export the results "
-    "to CSV or Excel for documentation."
+    "Below is the complete prediction table for the selected dataset, configuration, "
+    "and model. This includes each node's predicted class and class probabilities. "
+    "You can filter directly in the table and export to CSV or Excel."
 )
 
-# New: use the CSV exported by export_node_predictions(...)
 predictions_csv_path = (
     base_dir / "predictions" / f"{conv_type}_best_run_predictions.csv"
 )
@@ -266,32 +357,34 @@ predictions_csv_path = (
 if not predictions_csv_path.exists():
     st.warning(
         f"No prediction CSV found at {predictions_csv_path}. "
-        "Make sure export_node_predictions was called in create_diagnostics_plots."
+        "These are generated by export_node_predictions(...) in model.py."
     )
 else:
-    df_preds = pd.read_csv(predictions_csv_path)
+    preds_df = pd.read_csv(predictions_csv_path)
 
-    st.subheader("Node-level Predictions")
-    st.dataframe(df_preds, use_container_width=True)
+    # Optional: simple info
+    st.write(f"Total nodes in this prediction table: **{len(preds_df)}**")
 
-    # --- Download as CSV ---
-    csv_data = df_preds.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="⬇️ Download Predictions as CSV",
-        data=csv_data,
-        file_name=f"{dataset_name}_{conv_type}_predictions.csv",
-        mime="text/csv",
-    )
+    # Show full table
+    st.dataframe(preds_df, use_container_width=True, height=500)
 
-    # --- Download as Excel ---
-    excel_buffer = io.BytesIO()
-    with pd.ExcelWriter(excel_buffer, engine="xlsxwriter") as writer:
-        df_preds.to_excel(writer, index=False, sheet_name="Predictions")
-    excel_buffer.seek(0)
-
-    st.download_button(
-        label="⬇️ Download Predictions as Excel",
-        data=excel_buffer,
-        file_name=f"{dataset_name}_{conv_type}_predictions.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    # Download buttons (CSV + Excel)
+    col_p1, col_p2 = st.columns(2)
+    with col_p1:
+        csv_bytes = preds_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="Download Predictions (CSV)",
+            data=csv_bytes,
+            file_name=f"{dataset_name}_{exp_id}_{conv_type}_predictions.csv",
+            mime="text/csv",
+        )
+    with col_p2:
+        xls_buf = io.BytesIO()
+        preds_df.to_excel(xls_buf, index=False, sheet_name="predictions")
+        xls_buf.seek(0)
+        st.download_button(
+            label="Download Predictions (Excel)",
+            data=xls_buf,
+            file_name=f"{dataset_name}_{exp_id}_{conv_type}_predictions.xlsx",
+            mime=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        )
