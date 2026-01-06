@@ -15,7 +15,7 @@
   "jk": "max",
   "normalize": false,
   "enable_lcs_masking": true,
-  "lcs_threshold": 0.3,
-  "mini_batch_training": true,
+  "lcs_threshold": 0.5,
+  "mini_batch_training": false,
   "mini_batch_size": 1024
 }

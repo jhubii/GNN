@@ -1,3 +1,8 @@
+import time
+
+import numpy as np
+import pandas as pd
+
 import torch
 from torch import nn, optim
 import pytorch_lightning as pl
@@ -95,7 +100,11 @@ class DirGCNConv(torch.nn.Module):
             "naive_ops": 0,  # how many MP ops a naive implementation would do
             "actual_ops": 0,  # actual ops (same as naive for baseline layer)
             "saved_ops": 0,
+            "naive_aggregations": 0,
+            "actual_aggregations": 0,
+            "saved_aggregations": 0,
             "saved_ratio": 0.0,
+            "num_forwards": 0,
         }
 
     def forward(self, x, edge_index):
@@ -120,10 +129,16 @@ class DirGCNConv(torch.nn.Module):
         # ---- Message-passing operation counter ----
         # 2 directional paths (in / out) per edge
         ops_this_layer = 2 * num_edges
+        aggs_this_layer = num_edges  # 1 aggregation per edge per direction pair
+
         self.mp_operation_stats["naive_ops"] += ops_this_layer
         self.mp_operation_stats["actual_ops"] += ops_this_layer
+        self.mp_operation_stats["naive_aggregations"] += aggs_this_layer
+        self.mp_operation_stats["actual_aggregations"] += aggs_this_layer
         self.mp_operation_stats["saved_ops"] = 0
+        self.mp_operation_stats["saved_aggregations"] = 0
         self.mp_operation_stats["saved_ratio"] = 0.0
+        self.mp_operation_stats["num_forwards"] += 1
 
         return out
 
@@ -221,12 +236,19 @@ class GatedDirGCNConv(torch.nn.Module):
         self._num_edges_total = None
         self._num_unique_edges = None
 
+        # Cached Local Contribution Score per UNIQUE edge (computed once)
+        self._lcs_per_edge = None
+
         # Explicit MP-operation counter (compares naive vs cached)
         self.mp_operation_stats = {
             "naive_ops": 0,
             "actual_ops": 0,
             "saved_ops": 0,
+            "naive_aggregations": 0,
+            "actual_aggregations": 0,
+            "saved_aggregations": 0,
             "saved_ratio": 0.0,
+            "num_forwards": 0,
         }
 
         # Alpha kept for compatibility with get_conv API (not used directly)
@@ -264,6 +286,8 @@ class GatedDirGCNConv(torch.nn.Module):
                 "num_unique_edges": 0,
                 "num_recurring_edges": 0,
                 "recurring_ratio": 0.0,
+                "cache_hits": 0,
+                "cache_hit_ratio": 0.0,
             }
             return
 
@@ -300,6 +324,9 @@ class GatedDirGCNConv(torch.nn.Module):
             "num_unique_edges": self._num_unique_edges,
             "num_recurring_edges": num_recurring_edges,
             "recurring_ratio": recurring_ratio,
+            # For Problem 3 Solution 3:
+            "cache_hits": num_recurring_edges,
+            "cache_hit_ratio": recurring_ratio,
         }
 
     # -------------------- Mini-Batch Recurrence / Neighbor-Value Sampler ---- #
@@ -316,6 +343,13 @@ class GatedDirGCNConv(torch.nn.Module):
         """
         Implements the Recurrence / Neighbor-Value sampling heuristic
         described in Section 3.4.1 (Mini-Batch Sampling).
+
+        IMPORTANT CHANGE:
+        ------------------
+        - We now reuse a *cached* LCS value per UNIQUE edge (self._lcs_per_edge)
+          instead of recomputing LCS via an MLP every forward.
+        - This makes the enhanced model much cheaper per epoch while still
+          prioritizing high-contribution, recurring neighbors.
 
         Given:
           - x: [N, F] node features
@@ -357,11 +391,17 @@ class GatedDirGCNConv(torch.nn.Module):
         else:
             rs = torch.zeros_like(counts_incident)
 
-        # 3) Neighbor Value Score (NVS): based on Local Contribution Score (LCS)
-        x_src = x[src_u[edge_idx_incident]]
-        x_dst = x[dst_u[edge_idx_incident]]
-        lcs_input = torch.cat([x_src, x_dst], dim=-1)
-        nvs = torch.sigmoid(self.lcs_mlp(lcs_input)).squeeze(-1)  # already in (0,1)
+        # 3) Neighbor Value Score (NVS): based on cached Local Contribution Score
+        if self._lcs_per_edge is None:
+            # Fallback: compute once here (same as in forward)
+            x_src_full = x[src_u]
+            x_dst_full = x[dst_u]
+            lcs_input_full = torch.cat([x_src_full, x_dst_full], dim=-1)
+            self._lcs_per_edge = (
+                torch.sigmoid(self.lcs_mlp(lcs_input_full)).squeeze(-1).detach()
+            )
+
+        nvs = self._lcs_per_edge.to(device)[edge_idx_incident]
 
         # 4) Combined importance
         total_w = recurrence_weight + neighbor_value_weight
@@ -406,7 +446,6 @@ class GatedDirGCNConv(torch.nn.Module):
         src_u = self._unique_src
         dst_u = self._unique_dst
         counts = self._unique_counts.float()
-        num_edges_total_global = int(self._num_edges_total or 0)
 
         # ---- Mini-batch sampling over UNIQUE edges (optional) ----
         if batch_nodes is not None:
@@ -429,18 +468,24 @@ class GatedDirGCNConv(torch.nn.Module):
 
         # --------------------------------------------------
         # 1) Local Contribution Score (LCS) for each UNIQUE sampled edge
+        #    (CACHED: computed once from static node features)
         # --------------------------------------------------
-        x_src = x[src_sampled]  # [E_eff, F]
-        x_dst = x[dst_sampled]  # [E_eff, F]
+        if self._lcs_per_edge is None:
+            with torch.no_grad():
+                x_src_full = x[src_u]
+                x_dst_full = x[dst_u]
+                lcs_input_full = torch.cat([x_src_full, x_dst_full], dim=-1)
+                self._lcs_per_edge = (
+                    torch.sigmoid(self.lcs_mlp(lcs_input_full)).squeeze(-1).detach()
+                )  # [E_unique]
 
-        lcs_input = torch.cat([x_src, x_dst], dim=-1)  # [E_eff, 2F]
-        lcs = torch.sigmoid(self.lcs_mlp(lcs_input)).squeeze(-1)  # [E_eff]
+        # Re-index cached LCS for sampled edges
+        lcs = self._lcs_per_edge.to(x.device)[sampled_idx]  # [E_eff]
 
         # --------------------------------------------------
         # 2) LCS Masking (optional redundancy control)
         # --------------------------------------------------
         # For MP-operation diagnostics we track two notions:
-        #   - num_edges_total_global: full-graph duplicate edges
         #   - num_edges_total_effective: edges (with duplicates) in this sampled set
         num_edges_total_effective = int(counts_sampled.sum().item())
 
@@ -552,15 +597,27 @@ class GatedDirGCNConv(torch.nn.Module):
 
         self.mp_operation_stats["naive_ops"] += naive_ops_this
         self.mp_operation_stats["actual_ops"] += actual_ops_this
+
+        # Aggregations = number of edges considered (effective vs unique)
+        self.mp_operation_stats["naive_aggregations"] += num_edges_total_effective
+        self.mp_operation_stats["actual_aggregations"] += num_unique_effective
+
         self.mp_operation_stats["saved_ops"] = (
             self.mp_operation_stats["naive_ops"] - self.mp_operation_stats["actual_ops"]
         )
-        if self.mp_operation_stats["naive_ops"] > 0:
+        self.mp_operation_stats["saved_aggregations"] = (
+            self.mp_operation_stats["naive_aggregations"]
+            - self.mp_operation_stats["actual_aggregations"]
+        )
+
+        if self.mp_operation_stats["naive_aggregations"] > 0:
             self.mp_operation_stats["saved_ratio"] = float(
-                self.mp_operation_stats["saved_ops"]
-            ) / float(self.mp_operation_stats["naive_ops"])
+                self.mp_operation_stats["saved_aggregations"]
+            ) / float(self.mp_operation_stats["naive_aggregations"])
         else:
             self.mp_operation_stats["saved_ratio"] = 0.0
+
+        self.mp_operation_stats["num_forwards"] += 1
 
         return out
 
@@ -1019,3 +1076,227 @@ def get_model(args):
         lcs_threshold=getattr(args, "lcs_threshold", 0.0),
         enable_lcs_masking=getattr(args, "enable_lcs_masking", False),
     )
+
+
+# ---------------------------------------------------------------------------
+# NEW: Helpers for Prediction Export, Inference Time, and Problem 3 Metrics
+# ---------------------------------------------------------------------------
+
+
+def export_node_predictions(model, data, output_path: str, class_names=None):
+    """
+    Export node-level predictions and probabilities to CSV.
+
+    Columns:
+      - node_idx
+      - y_true (if available)
+      - y_pred
+      - prob_class_0 / prob_class_1 / ...  OR
+        prob_<class_name> if class_names is provided.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    x = data.x.to(device)
+    edge_index = data.edge_index.to(device)
+
+    with torch.no_grad():
+        log_probs = model(x, edge_index, batch_nodes=None)  # log-softmax
+        probs = torch.exp(log_probs)
+
+    num_nodes = x.size(0)
+    num_classes = probs.size(1)
+
+    y_true = None
+    if getattr(data, "y", None) is not None:
+        y_true = data.y.view(-1).cpu().numpy()
+
+    y_pred = probs.argmax(dim=1).cpu().numpy()
+    probs_np = probs.cpu().numpy()
+
+    df_dict = {
+        "node_idx": np.arange(num_nodes, dtype=int),
+        "y_pred": y_pred,
+    }
+    if y_true is not None and len(y_true) == num_nodes:
+        df_dict["y_true"] = y_true
+
+    if class_names is not None and len(class_names) == num_classes:
+        prob_cols = [f"prob_{c}" for c in class_names]
+    else:
+        prob_cols = [f"prob_class_{i}" for i in range(num_classes)]
+
+    for j, col in enumerate(prob_cols):
+        df_dict[col] = probs_np[:, j]
+
+    df = pd.DataFrame(df_dict)
+    df.to_csv(output_path, index=False)
+    return df
+
+
+def measure_inference_time(model, data, runs: int = 10):
+    """
+    Measure average inference time (forward pass) over the full graph.
+
+    Returns:
+      avg_time_seconds
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    x = data.x.to(device)
+    edge_index = data.edge_index.to(device)
+
+    # Warmup
+    with torch.no_grad():
+        _ = model(x, edge_index, batch_nodes=None)
+
+    runs = max(int(runs), 1)
+    start = time.perf_counter()
+    with torch.no_grad():
+        for _ in range(runs):
+            _ = model(x, edge_index, batch_nodes=None)
+    end = time.perf_counter()
+
+    return (end - start) / runs
+
+
+def collect_problem3_metrics(model):
+    """
+    Collect Problem 3-related diagnostics from all convolution layers.
+
+    Returns a dict:
+      {
+        "per_layer": [ {layer metrics...}, ... ],
+        "summary": {
+            "total_naive_aggregations": ...,
+            "total_actual_aggregations": ...,
+            "total_saved_aggregations": ...,
+            "total_saved_ratio": ...,
+            "total_edges": ...,
+            "total_recurring_edges": ...,
+            "global_cache_hit_ratio": ...,
+        }
+      }
+
+    Aggregation counts are normalised per forward (using num_forwards) so
+    they can accumulate over training + diagnostics runs without changing
+    the *per-forward* interpretation.
+    """
+    per_layer = []
+
+    total_naive_aggs = 0.0
+    total_actual_aggs = 0.0
+    total_saved_aggs = 0.0
+
+    total_edges = 0
+    total_recurring_edges = 0
+
+    if not hasattr(model, "convs"):
+        return {"per_layer": [], "summary": {}}
+
+    for idx, conv in enumerate(model.convs):
+        layer_entry = {
+            "layer_idx": idx,
+            "conv_type": type(conv).__name__,
+        }
+
+        # --- MP / aggregation stats ---
+        mp = getattr(conv, "mp_operation_stats", None)
+        if mp is not None:
+            num_forwards = max(int(mp.get("num_forwards", 1)), 1)
+
+            naive_aggs_total = float(
+                mp.get(
+                    "naive_aggregations",
+                    mp.get("naive_ops", 0) / 2.0,
+                )
+            )
+            actual_aggs_total = float(
+                mp.get(
+                    "actual_aggregations",
+                    mp.get("actual_ops", 0) / 2.0,
+                )
+            )
+
+            naive_aggs = naive_aggs_total / num_forwards
+            actual_aggs = actual_aggs_total / num_forwards
+            saved_aggs = naive_aggs - actual_aggs
+
+            saved_ratio = float(mp.get("saved_ratio", 0.0))
+
+            layer_entry.update(
+                {
+                    "naive_aggregations": naive_aggs,
+                    "actual_aggregations": actual_aggs,
+                    "saved_aggregations": saved_aggs,
+                    "saved_ratio": saved_ratio,
+                }
+            )
+
+            total_naive_aggs += naive_aggs
+            total_actual_aggs += actual_aggs
+            total_saved_aggs += saved_aggs
+
+        # --- Recurring transaction stats + cache hit ratio ---
+        rec = getattr(conv, "recurring_transaction_stats", None)
+        if rec is not None:
+            num_edges = int(rec.get("num_edges", 0))
+            num_unique = int(rec.get("num_unique_edges", 0))
+            num_rec = int(rec.get("num_recurring_edges", 0))
+            rec_ratio = float(rec.get("recurring_ratio", 0.0))
+            cache_hits = int(rec.get("cache_hits", num_rec))
+            cache_hit_ratio = float(rec.get("cache_hit_ratio", rec_ratio))
+
+            layer_entry.update(
+                {
+                    "rec_num_edges": num_edges,
+                    "rec_num_unique_edges": num_unique,
+                    "rec_num_recurring_edges": num_rec,
+                    "rec_recurring_ratio": rec_ratio,
+                    "cache_hits": cache_hits,
+                    "cache_hit_ratio": cache_hit_ratio,
+                }
+            )
+
+            total_edges += num_edges
+            total_recurring_edges += num_rec
+
+        # --- LCS masking stats ---
+        lcs = getattr(conv, "lcs_masking_stats", None)
+        if lcs is not None:
+            for k, v in lcs.items():
+                layer_entry[f"lcs_{k}"] = v
+
+        per_layer.append(layer_entry)
+
+    if total_naive_aggs > 0:
+        total_saved_ratio = float(total_saved_aggs) / float(total_naive_aggs)
+    else:
+        total_saved_ratio = 0.0
+
+    if total_edges > 0:
+        global_cache_hit_ratio = float(total_recurring_edges) / float(total_edges)
+    else:
+        global_cache_hit_ratio = 0.0
+
+    summary = {
+        "total_naive_aggregations": total_naive_aggs,
+        "total_actual_aggregations": total_actual_aggs,
+        "total_saved_aggregations": total_saved_aggs,
+        "total_saved_ratio": total_saved_ratio,
+        "total_edges": int(total_edges),
+        "total_recurring_edges": int(total_recurring_edges),
+        "global_cache_hit_ratio": global_cache_hit_ratio,
+    }
+
+    return {"per_layer": per_layer, "summary": summary}
+
+
+def problem3_metrics_to_dataframe(metrics_dict):
+    """
+    Convert collect_problem3_metrics(...) output into a pandas DataFrame
+    (per-layer view) for easy CSV export and Chapter 4 tables.
+    """
+    per_layer = metrics_dict.get("per_layer", [])
+    if not per_layer:
+        return pd.DataFrame()
+    return pd.DataFrame(per_layer)

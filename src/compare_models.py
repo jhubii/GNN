@@ -19,6 +19,10 @@ from src.model import (
     get_model,
     LightingFullBatchModelWrapper,
     LightingMiniBatchDirGatedWrapper,
+    export_node_predictions,
+    measure_inference_time,
+    collect_problem3_metrics,
+    problem3_metrics_to_dataframe,
 )
 from src.utils.arguments import args  # parsed from CLI
 
@@ -74,7 +78,7 @@ def save_hyperparams(local_args, results_root: str):
 
 
 # ============================================================================
-# Diagnostics: confusion / ROC / PR + structural / LCS / MP stats
+# Diagnostics: confusion / ROC / PR + structural / LCS / MP stats / Problem 3
 # ============================================================================
 
 
@@ -105,9 +109,18 @@ def create_diagnostics_plots(
         (and legacy names structural_redundancy / lcs_redundancy_stats)
       - save them into JSON so they can be used in Chapter 4 tables.
 
+    NEW (Problem 3 / Solution 3 additions):
+      - collect and export Problem 3 metrics across layers as CSV + JSON summary
+      - export node-level prediction table as CSV
+      - measure inference runtime (average over several runs) and save to JSON
+
     Saved under:
         results_root/plots/<conv_type>/
         results_root/struct_lcs_stats/<conv_type>_best_run_struct_lcs_stats.json
+        results_root/problem3_metrics/<conv_type>_best_run_problem3_metrics.csv
+        results_root/problem3_metrics/<conv_type>_best_run_problem3_summary.json
+        results_root/predictions/<conv_type>_best_run_predictions.csv
+        results_root/runtime/<conv_type>_best_run_inference_runtime.json
     """
     import matplotlib.pyplot as plt
     from sklearn.metrics import (
@@ -155,10 +168,10 @@ def create_diagnostics_plots(
     edge_index = data.edge_index.to(device)
     y = data.y.long().view(-1).to(device)
 
+    # ---------------- Single full-graph forward for diagnostics --------------
     with torch.no_grad():
-        # Full-graph forward for diagnostics
-        logits = model(x, edge_index, batch_nodes=None)  # [N, C]
-        probs = torch.softmax(logits, dim=1)
+        logits = model(x, edge_index, batch_nodes=None)  # [N, C] (log-softmax)
+        probs = torch.exp(logits)
         y_true = y[test_mask].cpu().numpy()
         y_pred = probs.argmax(dim=1)[test_mask].cpu().numpy()
 
@@ -236,7 +249,7 @@ def create_diagnostics_plots(
         print(f"Skipping ROC/PR curves for {label} (num_classes={num_classes} > 2).")
 
     # ------------------------------------------------------------------
-    # Structural / LCS / MP-operation stats for each layer
+    # Structural / LCS / MP-operation stats for each layer (per-forward)
     # ------------------------------------------------------------------
     diagnostics_by_layer = {}
     if hasattr(model, "convs"):
@@ -286,6 +299,64 @@ def create_diagnostics_plots(
     else:
         print(f"No structural/LCS/MP diagnostics found for {label}.")
 
+    # ------------------------------------------------------------------
+    # NEW: Problem 3 metrics (aggregations + redundancy) across layers
+    # ------------------------------------------------------------------
+    p3_metrics = collect_problem3_metrics(model)
+    p3_df = problem3_metrics_to_dataframe(p3_metrics)
+
+    p3_dir = os.path.join(results_root, "problem3_metrics")
+    os.makedirs(p3_dir, exist_ok=True)
+
+    if not p3_df.empty:
+        p3_csv_path = os.path.join(p3_dir, f"{conv_type}_best_run_problem3_metrics.csv")
+        p3_df.to_csv(p3_csv_path, index=False)
+
+        p3_summary_path = os.path.join(
+            p3_dir, f"{conv_type}_best_run_problem3_summary.json"
+        )
+        with open(p3_summary_path, "w") as f:
+            json.dump(p3_metrics.get("summary", {}), f, indent=2)
+
+        print(f"Saved Problem 3 metrics to: {p3_csv_path}")
+    else:
+        print(f"No Problem 3 metrics collected for {label}.")
+
+    # ------------------------------------------------------------------
+    # NEW: Full prediction table (all nodes) -> CSV
+    # ------------------------------------------------------------------
+    preds_dir = os.path.join(results_root, "predictions")
+    os.makedirs(preds_dir, exist_ok=True)
+    preds_path = os.path.join(preds_dir, f"{conv_type}_best_run_predictions.csv")
+
+    # Optional: provide class_names if desired; here we keep generic names.
+    export_node_predictions(model, data, preds_path, class_names=None)
+    print(f"Saved node-level prediction table to: {preds_path}")
+
+    # ------------------------------------------------------------------
+    # NEW: Inference runtime (Solution 3: Inference speed ×)
+    # ------------------------------------------------------------------
+    runtime_dir = os.path.join(results_root, "runtime")
+    os.makedirs(runtime_dir, exist_ok=True)
+
+    # Use a deepcopy so we don't further perturb diagnostic counters on 'model'.
+    avg_inf_time = measure_inference_time(deepcopy(model), data, runs=10)
+    runtime_path = os.path.join(
+        runtime_dir, f"{conv_type}_best_run_inference_runtime.json"
+    )
+    with open(runtime_path, "w") as f:
+        json.dump(
+            {
+                "conv_type": conv_type,
+                "label": label,
+                "best_run_index": int(best_run_idx),
+                "avg_inference_time_seconds": float(avg_inf_time),
+            },
+            f,
+            indent=2,
+        )
+    print(f"Saved inference runtime stats to: {runtime_path}")
+
 
 # ============================================================================
 # Training of a single model type (baseline or enhanced) – full-batch vs mini
@@ -309,9 +380,41 @@ def run_single_model(base_args, conv_type: str, label: str, results_root: str):
     All outputs are saved neatly under:
         results_root/<conv_type>/run_<k>/  (checkpoints, per-run metrics, CSV logs)
         results_root/<conv_type>/summary.json
+
+    NOTE:
+      Inference runtime + Problem 3 metrics + prediction CSV are produced
+      in create_diagnostics_plots(...) for the best run.
     """
     local_args = deepcopy(base_args)
     local_args.conv_type = conv_type
+
+    # ---- NEW: auto-configure enhanced DIR-GCN for efficiency ----
+    if conv_type == "dir-gcn-gated":
+        # Turn on mini-batch training unless the user explicitly disabled it
+        if not hasattr(local_args, "mini_batch_training"):
+            local_args.mini_batch_training = True
+        elif local_args.mini_batch_training is False:
+            # respect explicit False from CLI
+            pass
+        else:
+            local_args.mini_batch_training = True
+
+        # Default mini-batch size if not provided
+        if (
+            not hasattr(local_args, "mini_batch_size")
+            or local_args.mini_batch_size <= 0
+        ):
+            local_args.mini_batch_size = 1024
+
+        # Make sure LCS masking is active with a reasonable threshold
+        if (
+            not hasattr(local_args, "enable_lcs_masking")
+            or not local_args.enable_lcs_masking
+        ):
+            local_args.enable_lcs_masking = True
+        if not hasattr(local_args, "lcs_threshold") or local_args.lcs_threshold <= 0.0:
+            local_args.lcs_threshold = 0.5
+    # --------------------------------------------------------------
 
     model_results_dir = os.path.join(results_root, conv_type)
     os.makedirs(model_results_dir, exist_ok=True)
@@ -670,9 +773,10 @@ if __name__ == "__main__":
         results_root_cfg = os.path.join(dataset_root, exp_id)
         print(f"Experiment ID ({cfg_id}): {exp_id}")
 
+        # Save the “global” config once (shared things like dataset, num_runs, etc.)
         save_hyperparams(local_args, results_root_cfg)
 
-        # Baseline Dir-GCN (always full-batch)
+        # Baseline (full-batch)
         baseline_results = run_single_model(
             base_args=local_args,
             conv_type="dir-gcn",
@@ -680,7 +784,7 @@ if __name__ == "__main__":
             results_root=results_root_cfg,
         )
 
-        # Enhanced Dir-GCN (gated) – full-batch or mini-batch depending on flags
+        # Enhanced (will auto-enable mini-batch + LCS)
         enhanced_results = run_single_model(
             base_args=local_args,
             conv_type="dir-gcn-gated",
