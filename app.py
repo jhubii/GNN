@@ -873,8 +873,7 @@ with tabs[1]:
         "or manually enter a single transaction. The app rebuilds the graph, runs the "
         "trained GNN, and shows the fraud probability for the origin account.\n"
         "- For **Synthetic Fraud** and **Elliptic**, live CSV/manual inference is not "
-        "exposed here (these datasets are mainly for offline benchmarking), but the "
-        "UI remains consistent."
+        "exposed here (these datasets are mainly for offline benchmarking). "
     )
 
     if dataset_name != "online-payments":
