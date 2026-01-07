@@ -4,5 +4,7 @@ openpyxl
 torch
 torch_geometric
 pytorch_lightning
--f https://data.pyg.org/whl/torch-1.13.0+cpu.html torch-scatter
--f https://data.pyg.org/whl/torch-1.13.0+cpu.html torch-sparse
+f https://data.pyg.org/whl/torch-1.12.1+cpu.html
+torch-scatter
+-f https://data.pyg.org/whl/torch-1.12.1+cpu.html
+torch-sparse
