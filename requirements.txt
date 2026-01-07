@@ -13,4 +13,5 @@ torch-sparse
 
 # PyTorch Geometric built on top of torch / scatter / sparse
 torch-geometric
+pytorch-lightning>=2.2
 
