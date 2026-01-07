@@ -1,10 +1,9 @@
 streamlit==1.52.2
 pandas
 openpyxl
-torch
-torch_geometric
-pytorch_lightning
-f https://data.pyg.org/whl/torch-1.12.1+cpu.html
-torch-scatter
+torch==1.12.1
+torch-geometric==2.1.0
 -f https://data.pyg.org/whl/torch-1.12.1+cpu.html
-torch-sparse
+torch-scatter==2.0.9
+-f https://data.pyg.org/whl/torch-1.12.1+cpu.html
+torch-sparse==0.6.16
