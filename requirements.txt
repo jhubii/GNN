@@ -3,3 +3,4 @@ pandas
 openpyxl
 torch
 torch_geometric
+pytorch_lightning
