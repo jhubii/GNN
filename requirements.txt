@@ -2,3 +2,4 @@ streamlit==1.52.2
 pandas
 openpyxl
 torch
+torch_geometric
