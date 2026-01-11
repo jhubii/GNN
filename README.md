@@ -1,31 +1,34 @@
 # Dir-GCN Fraud Detection Demo
 
-This repo contains:
+This repository contains implementations of:
 
-- **Baseline Dir-GCN** and **Enhanced Dir-GCN (Gated)** models  
-- Experiments on three fraud datasets:
-  - **Synthetic Fraud** (`fraud-syn`)
-  - **Online Payments** (`online-payments`)
-  - **Elliptic Bitcoin** (`elliptic`)
-- A **Streamlit dashboard** (`app.py`) to:
-  - Visualize **time/memory/runtime (Problem 1)**
-  - Compare **accuracy / F1 / precision / recall (Problem 2)**
-  - Show **redundancy, caching, LCS masking (Problem 3)**
-  - Run **live inference** on new Online Payments transactions  
-    (upload CSV or manual single-transaction input)
+* **Baseline Dir-GCN**
+* **Enhanced Dir-GCN (Gated with LCS Masking & Structural Caching)**
+
+The models are evaluated on **three fraud detection datasets**:
+
+* **Synthetic Fraud** (`fraud-syn`)
+* **Online Payments** (`online-payments`)
+* **Elliptic Bitcoin Transactions** (`elliptic`)
+
+The project includes utilities for:
+
+* Dataset preprocessing
+* Multi-run experiment comparison
+* Runtime, memory, and redundancy analysis
 
 ---
 
 ## 1. Prerequisites
 
-### Recommended
+### Recommended Setup
 
-- **OS:** Linux / macOS / WSL
-- **Python:** **3.10** (important)
-- **conda**
+* **OS:** Windows / Linux / macOS
+* **Python:** **3.10 (required)**
+* **Conda (Miniconda or Anaconda)**
 
-> ⚠️ Torch 1.12.1 does **not** support Python 3.13+.  
-> Use Python **3.10** to avoid “No matching distribution found for torch==1.12.1”.
+> ⚠️ This project relies on PyTorch Geometric wheels.
+> Python versions **above 3.10 are NOT recommended**.
 
 ---
 
@@ -33,151 +36,157 @@ This repo contains:
 
 ```bash
 git clone <your-repo-url>.git
-cd gnn
+cd GNN
 ```
 
 ---
 
-## 3. Create and Activate Conda Environment
+## 3. Environment Setup
+
+Create the Conda environment using the provided configuration:
 
 ```bash
-conda create -n dirgnn python=3.10 -y
+conda env create -f environment.yml
 conda activate dirgnn
 ```
+
+Verify installation:
+
+```bash
+python -c "import torch; import torch_geometric; print('Environment ready')"
 ```
 
 ---
 
-## 4. Install Dependencies
+## 4. Dataset Setup
 
-### Option A — use provided requirements (recommended)
+All datasets must follow the same directory structure.
 
-Contents of `requirements.txt`:
+### 4.1 Create Dataset Directories
 
-```txt
-streamlit==1.52.2
-pandas
-openpyxl
-
-torch==1.12.1
-torch-geometric==2.1.0
-
--f https://data.pyg.org/whl/torch-1.12.1+cpu.html
-torch-scatter==2.0.9
-
--f https://data.pyg.org/whl/torch-1.12.1+cpu.html
-torch-sparse==0.6.16
-
-pytorch-lightning>=2.2
-```
-
-Install:
+From the project root:
 
 ```bash
-pip install --upgrade pip
+mkdir dataset
+
+mkdir dataset/fraud_syn dataset/elliptic dataset/online_payments
+mkdir dataset/fraud_syn/raw dataset/fraud_syn/processed
+mkdir dataset/elliptic/raw dataset/elliptic/processed
+mkdir dataset/online_payments/raw dataset/online_payments/processed
+```
+
+---
+
+### 4.2 Synthetic Fraud (`fraud-syn`)
+
+No download required.
+The dataset is generated automatically during preprocessing.
+
+---
+
+### 4.3 Online Payments (`online-payments`)
+
+1. Download the **PaySim / Online Payments Fraud dataset** from Kaggle
+2. Place the CSV file inside:
+
+```text
+dataset/online_payments/raw/
+```
+
+---
+
+### 4.4 Elliptic Bitcoin (`elliptic`)
+
+Download the following files:
+
+* `elliptic_txs_features.csv`
+* `elliptic_txs_classes.csv`
+* `elliptic_txs_edgelist.csv`
+
+Place all files inside:
+
+```text
+dataset/elliptic/raw/
+```
+
+---
+
+## 5. Dataset Preprocessing
+
+Run each preprocessing script **once** before training.
+
+```bash
+python -m src.prepare_fraud_syn
+python -m src.prepare_elliptic
+python -m src.prepare_online_payments
+```
+
+Processed datasets will be saved to:
+
+```text
+dataset/<dataset_name>/processed/
+```
+
+---
+
+## 6. Model Training & Evaluation
+
+Run experiments using `compare_models.py`.
+
+> ⚠️ On Windows PowerShell, use **single-line commands**
+> (line continuation with `\` is for Bash only).
+
+---
+
+### 6.1 Synthetic Fraud
+
+```bash
+python -m src.compare_models --dataset fraud-syn --num_runs 5 --lcs_threshold 0.5 --enable_lcs_masking
+```
+
+---
+
+### 6.2 Elliptic
+
+```bash
+python -m src.compare_models --dataset elliptic --num_runs 5 --lcs_threshold 0.5 --enable_lcs_masking
+```
+
+---
+
+### 6.3 Online Payments
+
+```bash
+python -m src.compare_models --dataset online-payments --num_runs 5 --lcs_threshold 0.5 --enable_lcs_masking
+```
+
+---
+
+## 7. Streamlit Dashboard (Optional)
+
+The Streamlit dashboard has its **own dependencies**, listed in `requirements.txt`.
+
+### 7.1 Install Streamlit Requirements
+
+Make sure the Conda environment is active:
+
+```bash
+conda activate dirgnn
+```
+
+Then install the Streamlit-specific requirements:
+
+```bash
 pip install -r requirements.txt
 ```
 
-or with **uv**:
-
-```bash
-uv pip install -r requirements.txt
-```
-
-> These URLs install compatible **PyG wheels for CPU**.
+> This file contains only the packages required for the dashboard (e.g., Streamlit, Pandas, visualization utilities).
 
 ---
 
-### Option B — newer PyTorch/PyG stack (optional)
+### 7.2 Run the Streamlit App
 
-You can upgrade Torch and PyG if you wish, but ensure version compatibility:
-https://github.com/pyg-team/pytorch_geometric#installation
-
----
-
-## 5. Dataset Setup
-
-### 5.1 Synthetic Fraud (`fraud-syn`)
-No downloads needed — generated automatically.
-
-Output appears under:
-
-```text
-data/syn-fraud/processed/fraud_data_v4.pt
-```
-
----
-
-### 5.2 Online Payments (`online-payments`)
-
-1. Download PaySim / Online Payments Fraud dataset from Kaggle
-2. Create folders:
-
-```bash
-mkdir -p data/online_payments/raw
-```
-
-3. Save file as:
-
-```text
-data/online_payments/raw/online_payments.csv
-```
-
----
-
-### 5.3 Elliptic Bitcoin (`elliptic`)
-
-Download:
-
-- `elliptic_txs_features.csv`
-- `elliptic_txs_classes.csv`
-- `elliptic_txs_edgelist.csv`
-
-Create:
-
-```bash
-mkdir -p data/elliptic/raw
-```
-
-Place files there.
-
-Processed file will be created:
-
-```text
-data/elliptic/processed/elliptic.pt
-```
-
----
-
-## 6. Training Models (optional)
-
-Skip if you already have a `results/` directory with checkpoints.
-
-Run:
-
-```bash
-python -m src.compare_models --dataset fraud-syn
-python -m src.compare_models --dataset online-payments
-python -m src.compare_models --dataset elliptic
-```
-
-Results structure:
-
-```text
-results/
-  <dataset>/
-    <exp_id>/
-      dir-gcn/
-      dir-gcn-gated/
-      predictions/
-      runtime/
-      plots/
-      problem3_metrics/
-```
-
----
-
-## 7. Run the Streamlit App
+From the project root:
 
 ```bash
 streamlit run app.py
@@ -187,97 +196,75 @@ Open the printed **local URL** in your browser.
 
 ---
 
-## 8. Using the Dashboard
+### 7.3 Dashboard Notes
 
-### Sidebar controls
-
-- Select **Dataset**
-- Select **Configuration (C1–C4)**
-- Select **Model (Baseline vs Enhanced)**
+* The dashboard reads experiment outputs from the `results/` directory.
+* Ensure at least one training run has been completed before opening the app.
+* Live inference is supported for the **Online Payments** dataset only.
 
 ---
 
-### Section 1 – Problem 1
-- training time
-- testing time
-- memory usage
-- inference runtime
+## 8. Results Structure
 
----
+After training, results are saved under:
 
-### Section 2 – Problem 2
-- accuracy
-- precision
-- recall
-- F1-score
-- ROC / PR curves
-- confusion matrix
-
----
-
-### Section 3 – Problem 3
-- redundant / recurring transactions
-- cache hit ratio
-- saved message aggregations
-- LCS masking metrics
-
----
-
-### Section 4 – Predictions & Live Inference
-
-#### Tab 1 — existing predictions
-Shows:
-- `y_true`
-- `y_pred`
-- class probabilities
-
-#### Tab 2 — live inference
-
-- **Online Payments only**
-
-Supports:
-- **Upload CSV**
-- **Manual transaction entry**
-
-Outputs:
-- `y_pred`
-- `prob_fraud`
-
-Synthetic Fraud & Elliptic currently:
-- show consistent UI
-- do not expose manual/CSV entry
-
----
-
-## 9. Common Errors & Fixes
-
-### `torch==1.12.1 not found`
-Use:
-
-```bash
-python=3.10
-```
-
-### `ModuleNotFoundError: pytorch_lightning`
-Install:
-
-```bash
-pip install pytorch-lightning
+```text
+results/
+├── <dataset>/
+│   └── <experiment_id>/
+│       ├── dir-gcn/
+│       ├── dir-gcn-gated/
+│       ├── predictions/
+│       ├── runtime/
+│       ├── plots/
+│       └── problem3_metrics/
 ```
 
 ---
 
-## 10. TL;DR Quickstart
+## 9. Configuration Notes
+
+* `--num_runs`
+  Number of repeated runs for experimental stability
+
+* `--enable_lcs_masking`
+  Enables redundancy-aware LCS masking and structural caching
+
+* `--lcs_threshold`
+  Similarity threshold used for LCS-based masking
+
+---
+
+## 10. Common Issues
+
+### PowerShell parsing errors
+
+Use single-line commands or backticks (`) instead of ``.
+
+### Module not found
+
+Ensure the environment is active:
 
 ```bash
-git clone <repo>
-cd gnn
+conda activate dirgnn
+```
 
-conda create -n dirgnn python=3.10 -y
+---
+
+## 11. Quick Start (TL;DR)
+
+```bash
+git clone <your-repo-url>.git
+cd GNN
+
+conda env create -f environment.yml
 conda activate dirgnn
 
-pip install -r requirements.txt
+python -m src.prepare_fraud_syn
+python -m src.compare_models --dataset fraud-syn --num_runs 5 --lcs_threshold 0.5 --enable_lcs_masking
 
+# Optional dashboard
+pip install -r requirements.txt
 streamlit run app.py
 ```
 
